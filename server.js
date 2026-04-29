@@ -77,9 +77,9 @@ app.post("/image-audio-to-video", upload.fields([
 /* =========================
    🎬 MERGE VIDEOS (YOUTUBE SAFE)
 ========================= */
-app.post("/merge-videos", upload.array("videos"), async (req, res) => {
+app.post("/merge-videos", upload.any(), async (req, res) => {
 
-  const files = req.files;
+  const files = req.files.filter(f => f.fieldname === "videos");
   const output = `tmp/merged_${Date.now()}.mp4`;
 
   if (!files || files.length < 2) {
