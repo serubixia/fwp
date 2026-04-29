@@ -14,10 +14,30 @@ app.post("/image-audio-to-video", upload.fields([
 
   const image = req.files.image[0].path;
   const audio = req.files.audio[0].path;
+  const effect = req.body.effect || "0";
+
   const output = `tmp/output_${Date.now()}.mp4`;
+
+  let videoFilter = "";
+
+  // 🎬 EFFECT 0: sin efecto
+  if (effect === "0") {
+    videoFilter = "";
+  }
+
+  // 🎬 EFFECT 1: zoom lento (Ken Burns)
+  if (effect === "1") {
+    videoFilter = "-vf \"zoompan=z='1.0+0.0015*on':d=125\"";
+  }
+
+  // 🎬 EFFECT 2: zoom + fade cinematic
+  if (effect === "2") {
+    videoFilter = "-vf \"zoompan=z='1.0+0.0015*on':d=125,fade=t=in:st=0:d=1,fade=t=out:st=999:d=1\"";
+  }
 
   const cmd = `
 ffmpeg -y -loop 1 -i ${image} -i ${audio} \
+${videoFilter} \
 -c:v libx264 -tune stillimage \
 -c:a aac -b:a 192k \
 -shortest -pix_fmt yuv420p ${output}
