@@ -15,11 +15,11 @@ app.post("/image-audio-to-video", upload.fields([
   { name: "audio" }
 ]), async (req, res) => {
 
-  const image = req.files.image[0].path;
-  const audio = req.files.audio[0].path;
+  const image = path.resolve(req.files.image[0].path);
+  const audio = path.resolve(req.files.audio[0].path)
   const effect = req.body.effect || "0";
 
-  const output = `tmp/output_${Date.now()}.mp4`;
+  const output = path.resolve(`tmp/output_${Date.now()}.mp4`);
 
   let vf = null;
 
@@ -68,7 +68,7 @@ app.post("/image-audio-to-video", upload.fields([
   execFile("ffmpeg", args, (err) => {
     if (err) return res.status(500).send(err.message);
 
-    res.sendFile(path.resolve(output));
+    res.sendFile(output);
   });
 
 });
@@ -79,17 +79,17 @@ app.post("/image-audio-to-video", upload.fields([
 ========================= */
 app.post("/merge-videos", upload.any(), async (req, res) => {
 
-  const files = req.files.filter(f => f.fieldname === "videos");
-  const output = `tmp/merged_${Date.now()}.mp4`;
+  const files = (req.files || []).filter(f => f.fieldname === "videos");
 
-  if (!files || files.length < 2) {
+  if (files.length < 2) {
     return res.status(400).send("Se necesitan al menos 2 videos");
   }
 
-  const listPath = `tmp/list_${Date.now()}.txt`;
+  const output = path.resolve(`tmp/merged_${Date.now()}.mp4`);
+  const listPath = path.resolve(`tmp/list_${Date.now()}.txt`);
 
   const listContent = files
-    .map(f => `file '${f.path}'`)
+    .map(f => `file '${path.resolve(f.path).replace(/\\/g, "/")}'`)
     .join("\n");
 
   fs.writeFileSync(listPath, listContent);
@@ -117,7 +117,7 @@ app.post("/merge-videos", upload.any(), async (req, res) => {
   execFile("ffmpeg", args, (err) => {
     if (err) return res.status(500).send(err.message);
 
-    res.sendFile(path.resolve(output));
+    res.sendFile(output);
   });
 
 });
