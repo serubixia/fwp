@@ -1,12 +1,15 @@
 const express = require("express");
 const multer = require("multer");
-const { exec } = require("child_process");
+const { execFile } = require("child_process");
 const path = require("path");
 const fs = require("fs");
 
 const app = express();
 const upload = multer({ dest: "tmp/" });
 
+/* =========================
+   🎬 IMAGE + AUDIO → VIDEO
+========================= */
 app.post("/image-audio-to-video", upload.fields([
   { name: "image" },
   { name: "audio" }
@@ -18,38 +21,107 @@ app.post("/image-audio-to-video", upload.fields([
 
   const output = `tmp/output_${Date.now()}.mp4`;
 
-  let videoFilter = "";
+  let vf = null;
 
-  // 🎬 EFFECT 0: sin efecto
+  // 🎬 EFFECT 0 — limpio
   if (effect === "0") {
-    videoFilter = "";
+    vf = null;
   }
 
-  // 🎬 EFFECT 1: zoom lento (Ken Burns)
+  // 🎬 EFFECT 1 — zoom suave (Ken Burns)
   if (effect === "1") {
-    videoFilter = "-vf \"zoompan=z='1.0+0.0015*on':d=125\"";
+    vf = "zoompan=z='min(zoom+0.0008,1.15)':d=1:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)',scale=1920:1080:force_original_aspect_ratio=cover";
   }
 
-  // 🎬 EFFECT 2: zoom + fade cinematic
+  // 🎬 EFFECT 2 — cinematic YouTube (RECOMENDADO)
   if (effect === "2") {
-    videoFilter = "-vf \"zoompan=z='1.0+0.0015*on':d=125,fade=t=in:st=0:d=1,fade=t=out:st=999:d=1\"";
+    vf = "zoompan=z='min(zoom+0.0012,1.2)':d=1,fade=t=in:st=0:d=1,fade=t=out:st=999:d=1,scale=1920:1080:force_original_aspect_ratio=cover";
   }
 
-  const cmd = `
-ffmpeg -y -loop 1 -i ${image} -i ${audio} \
-${videoFilter} \
--c:v libx264 -tune stillimage \
--c:a aac -b:a 192k \
--shortest -pix_fmt yuv420p ${output}
-`;
+  const args = [
+    "-y",
+    "-loop", "1",
+    "-i", image,
+    "-i", audio,
+  ];
 
-  exec(cmd, (err) => {
+  if (vf) {
+    args.push("-vf", vf);
+  }
+
+  args.push(
+    "-r", "30",
+    "-c:v", "libx264",
+    "-preset", "medium",
+    "-crf", "18",
+    "-pix_fmt", "yuv420p",
+
+    "-c:a", "aac",
+    "-b:a", "192k",
+    "-af", "loudnorm=I=-14:TP=-1.5:LRA=11",
+
+    "-shortest",
+    "-movflags", "+faststart",
+    output
+  );
+
+  execFile("ffmpeg", args, (err) => {
     if (err) return res.status(500).send(err.message);
 
     res.sendFile(path.resolve(output));
   });
 
 });
+
+
+/* =========================
+   🎬 MERGE VIDEOS (YOUTUBE SAFE)
+========================= */
+app.post("/merge-videos", upload.array("videos"), async (req, res) => {
+
+  const files = req.files;
+  const output = `tmp/merged_${Date.now()}.mp4`;
+
+  if (!files || files.length < 2) {
+    return res.status(400).send("Se necesitan al menos 2 videos");
+  }
+
+  const listPath = `tmp/list_${Date.now()}.txt`;
+
+  const listContent = files
+    .map(f => `file '${f.path}'`)
+    .join("\n");
+
+  fs.writeFileSync(listPath, listContent);
+
+  const args = [
+    "-y",
+    "-f", "concat",
+    "-safe", "0",
+    "-i", listPath,
+
+    "-c:v", "libx264",
+    "-preset", "medium",
+    "-crf", "18",
+
+    "-c:a", "aac",
+    "-b:a", "192k",
+
+    "-r", "30",
+    "-pix_fmt", "yuv420p",
+    "-movflags", "+faststart",
+
+    output
+  ];
+
+  execFile("ffmpeg", args, (err) => {
+    if (err) return res.status(500).send(err.message);
+
+    res.sendFile(path.resolve(output));
+  });
+
+});
+
 
 app.listen(3000, () => {
   console.log("FFmpeg API running on port 3000");
