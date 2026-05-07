@@ -611,6 +611,7 @@ function getUploadMimeType(upload, label) {
 function normalizeBase64UploadValue(value, label) {
   const rawValue = ensureNonEmptyString(value, label)
     .trim()
+    .replace(/^data:[^,]*;base64,/i, '')
     .replace(/\s+/g, '');
 
   const normalizedValue = rawValue
