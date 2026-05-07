@@ -580,6 +580,18 @@ function normalizeAudioSampleRate(value) {
   return normalizePositiveInteger(value, DEFAULT_AUDIO_SAMPLE_RATE, 'audio_sample_rate');
 }
 
+function normalizeBinaryBuffer(value, label) {
+  if (Buffer.isBuffer(value)) {
+    return value;
+  }
+
+  if (value instanceof Uint8Array || value instanceof ArrayBuffer) {
+    return Buffer.from(value);
+  }
+
+  throw new Error(`${label} must be a Buffer, Uint8Array, or ArrayBuffer.`);
+}
+
 function getUploadBase64Field(upload) {
   if (upload.base64 != null) {
     return {
@@ -637,6 +649,19 @@ function normalizeBase64UploadValue(value, label) {
 async function normalizeBinaryUpload(upload, label) {
   if (!upload || typeof upload !== 'object') {
     throw new Error(`${label} must be an object.`);
+  }
+
+  if (upload.buffer != null) {
+    const buffer = normalizeBinaryBuffer(upload.buffer, `${label}.buffer`);
+    if (buffer.length === 0) {
+      throw new Error(`${label} must not be empty.`);
+    }
+
+    return {
+      buffer,
+      filename: getUploadFilename(upload, label),
+      mime_type: getUploadMimeType(upload, label),
+    };
   }
 
   const uploadBase64Field = getUploadBase64Field(upload);
@@ -698,6 +723,14 @@ export async function materializeGenerateClipBinaryInputs(requestBody, tempRoot 
   const tempDir = await mkdtemp(path.join(tempRoot, GENERATE_CLIP_UPLOAD_DIR_PREFIX));
 
   try {
+    if (imageBinary != null && imageBinary.buffer == null) {
+      throw new Error('image_binary must be sent as an n8n binary file upload.');
+    }
+
+    if (voiceoverBinary != null && voiceoverBinary.buffer == null) {
+      throw new Error('voiceover_binary must be sent as an n8n binary file upload.');
+    }
+
     return {
       temp_dir: tempDir,
       image_path: imageBinary == null
