@@ -99,5 +99,5 @@ const server = http.createServer(async (request, response) => {
 });
 
 server.listen(PORT, () => {
-  console.log(`docker-ffmpeg listening on http://0.0.0.0:${PORT}`);
+  console.log(`ffmpeg-api listening on http://0.0.0.0:${PORT}`);
 });
