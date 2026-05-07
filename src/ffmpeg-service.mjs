@@ -329,79 +329,79 @@ function getDurationAwareMotionValue(durationSeconds, {
 
 const IMAGE_MOTION_PRESET_CONFIG = Object.freeze({
   static_hold: Object.freeze({
-    slow: Object.freeze({ zoomLevel: 1.012 }),
-    medium: Object.freeze({ zoomLevel: 1.018 }),
+    slow: Object.freeze({ zoomLevel: 1.02 }),
+    medium: Object.freeze({ zoomLevel: 1.035 }),
   }),
   slow_push_in: Object.freeze({
     slow: Object.freeze({
-      startZoom: 1.01,
-      zoomDelta: Object.freeze({ minValue: 0.018, maxValue: 0.045, valuePerSecond: 0.00075 }),
+      startZoom: 1.02,
+      zoomDelta: Object.freeze({ minValue: 0.03, maxValue: 0.10, valuePerSecond: 0.002 }),
     }),
     medium: Object.freeze({
-      startZoom: 1.014,
-      zoomDelta: Object.freeze({ minValue: 0.028, maxValue: 0.065, valuePerSecond: 0.00105 }),
+      startZoom: 1.02,
+      zoomDelta: Object.freeze({ minValue: 0.05, maxValue: 0.14, valuePerSecond: 0.0028 }),
     }),
   }),
   slow_pull_out: Object.freeze({
     slow: Object.freeze({
-      endZoom: 1.012,
-      zoomDelta: Object.freeze({ minValue: 0.022, maxValue: 0.048, valuePerSecond: 0.0008 }),
+      endZoom: 1.02,
+      zoomDelta: Object.freeze({ minValue: 0.03, maxValue: 0.10, valuePerSecond: 0.002 }),
     }),
     medium: Object.freeze({
-      endZoom: 1.016,
-      zoomDelta: Object.freeze({ minValue: 0.032, maxValue: 0.07, valuePerSecond: 0.0011 }),
+      endZoom: 1.02,
+      zoomDelta: Object.freeze({ minValue: 0.05, maxValue: 0.14, valuePerSecond: 0.0028 }),
     }),
   }),
   pan_left_slow: Object.freeze({
     slow: Object.freeze({
-      zoomDelta: Object.freeze({ minValue: 0.05, maxValue: 0.075, valuePerSecond: 0.001 }),
-      travelRatio: Object.freeze({ minValue: 0.08, maxValue: 0.16, valuePerSecond: 0.0022 }),
+      zoomDelta: Object.freeze({ minValue: 0.06, maxValue: 0.22, valuePerSecond: 0.0044 }),
+      travelRatio: Object.freeze({ minValue: 0.18, maxValue: 0.45, valuePerSecond: 0.009 }),
     }),
     medium: Object.freeze({
-      zoomDelta: Object.freeze({ minValue: 0.068, maxValue: 0.098, valuePerSecond: 0.0013 }),
-      travelRatio: Object.freeze({ minValue: 0.11, maxValue: 0.22, valuePerSecond: 0.0029 }),
+      zoomDelta: Object.freeze({ minValue: 0.09, maxValue: 0.28, valuePerSecond: 0.0056 }),
+      travelRatio: Object.freeze({ minValue: 0.22, maxValue: 0.45, valuePerSecond: 0.009 }),
     }),
   }),
   pan_right_slow: Object.freeze({
     slow: Object.freeze({
-      zoomDelta: Object.freeze({ minValue: 0.05, maxValue: 0.075, valuePerSecond: 0.001 }),
-      travelRatio: Object.freeze({ minValue: 0.08, maxValue: 0.16, valuePerSecond: 0.0022 }),
+      zoomDelta: Object.freeze({ minValue: 0.06, maxValue: 0.22, valuePerSecond: 0.0044 }),
+      travelRatio: Object.freeze({ minValue: 0.18, maxValue: 0.45, valuePerSecond: 0.009 }),
     }),
     medium: Object.freeze({
-      zoomDelta: Object.freeze({ minValue: 0.068, maxValue: 0.098, valuePerSecond: 0.0013 }),
-      travelRatio: Object.freeze({ minValue: 0.11, maxValue: 0.22, valuePerSecond: 0.0029 }),
+      zoomDelta: Object.freeze({ minValue: 0.09, maxValue: 0.28, valuePerSecond: 0.0056 }),
+      travelRatio: Object.freeze({ minValue: 0.22, maxValue: 0.45, valuePerSecond: 0.009 }),
     }),
   }),
   drift_up_soft: Object.freeze({
     slow: Object.freeze({
-      zoomDelta: Object.freeze({ minValue: 0.046, maxValue: 0.068, valuePerSecond: 0.0009 }),
-      travelRatio: Object.freeze({ minValue: 0.06, maxValue: 0.13, valuePerSecond: 0.0018 }),
+      zoomDelta: Object.freeze({ minValue: 0.06, maxValue: 0.22, valuePerSecond: 0.0044 }),
+      travelRatio: Object.freeze({ minValue: 0.18, maxValue: 0.45, valuePerSecond: 0.009 }),
     }),
     medium: Object.freeze({
-      zoomDelta: Object.freeze({ minValue: 0.06, maxValue: 0.085, valuePerSecond: 0.00115 }),
-      travelRatio: Object.freeze({ minValue: 0.085, maxValue: 0.17, valuePerSecond: 0.0023 }),
+      zoomDelta: Object.freeze({ minValue: 0.09, maxValue: 0.28, valuePerSecond: 0.0056 }),
+      travelRatio: Object.freeze({ minValue: 0.22, maxValue: 0.45, valuePerSecond: 0.009 }),
     }),
   }),
   drift_down_soft: Object.freeze({
     slow: Object.freeze({
-      zoomDelta: Object.freeze({ minValue: 0.046, maxValue: 0.068, valuePerSecond: 0.0009 }),
-      travelRatio: Object.freeze({ minValue: 0.06, maxValue: 0.13, valuePerSecond: 0.0018 }),
+      zoomDelta: Object.freeze({ minValue: 0.06, maxValue: 0.22, valuePerSecond: 0.0044 }),
+      travelRatio: Object.freeze({ minValue: 0.18, maxValue: 0.45, valuePerSecond: 0.009 }),
     }),
     medium: Object.freeze({
-      zoomDelta: Object.freeze({ minValue: 0.06, maxValue: 0.085, valuePerSecond: 0.00115 }),
-      travelRatio: Object.freeze({ minValue: 0.085, maxValue: 0.17, valuePerSecond: 0.0023 }),
+      zoomDelta: Object.freeze({ minValue: 0.09, maxValue: 0.28, valuePerSecond: 0.0056 }),
+      travelRatio: Object.freeze({ minValue: 0.22, maxValue: 0.45, valuePerSecond: 0.009 }),
     }),
   }),
   parallax_float: Object.freeze({
     slow: Object.freeze({
-      zoomDelta: Object.freeze({ minValue: 0.062, maxValue: 0.088, valuePerSecond: 0.0011 }),
-      horizontalTravelRatio: Object.freeze({ minValue: 0.06, maxValue: 0.12, valuePerSecond: 0.0015 }),
-      verticalAmplitudeRatio: Object.freeze({ minValue: 0.018, maxValue: 0.034, valuePerSecond: 0.00055 }),
+      zoomDelta: Object.freeze({ minValue: 0.06, maxValue: 0.22, valuePerSecond: 0.0044 }),
+      horizontalTravelRatio: Object.freeze({ minValue: 0.15, maxValue: 0.40, valuePerSecond: 0.008 }),
+      verticalAmplitudeRatio: Object.freeze({ minValue: 0.04, maxValue: 0.10, valuePerSecond: 0.002 }),
     }),
     medium: Object.freeze({
-      zoomDelta: Object.freeze({ minValue: 0.078, maxValue: 0.105, valuePerSecond: 0.00135 }),
-      horizontalTravelRatio: Object.freeze({ minValue: 0.085, maxValue: 0.16, valuePerSecond: 0.00195 }),
-      verticalAmplitudeRatio: Object.freeze({ minValue: 0.026, maxValue: 0.046, valuePerSecond: 0.00075 }),
+      zoomDelta: Object.freeze({ minValue: 0.09, maxValue: 0.28, valuePerSecond: 0.0056 }),
+      horizontalTravelRatio: Object.freeze({ minValue: 0.20, maxValue: 0.45, valuePerSecond: 0.009 }),
+      verticalAmplitudeRatio: Object.freeze({ minValue: 0.06, maxValue: 0.14, valuePerSecond: 0.0028 }),
     }),
   }),
 });
