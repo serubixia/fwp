@@ -59,6 +59,7 @@ const DEFAULT_AUDIO_SAMPLE_RATE = 48000;
 const DEFAULT_FONT_SIZE = 72;
 const DEFAULT_FONT_COLOR = 'white';
 const DEFAULT_BORDER_COLOR = 'black@0.45';
+const MAX_REMOTE_UPLOAD_BYTES = 64 * 1024 * 1024;
 const GENERATE_CLIP_UPLOAD_DIR_PREFIX = 'ffmpeg-api-generate-clip-';
 const MIME_TYPE_EXTENSIONS = Object.freeze({
   'image/png': '.png',
@@ -549,30 +550,101 @@ function normalizeBinaryBuffer(value, label) {
   throw new Error(`${label} must be a Buffer, Uint8Array, or ArrayBuffer.`);
 }
 
-function normalizeBinaryUpload(upload, label) {
+function getUploadBase64Value(upload) {
+  return upload.base64 ?? upload.data;
+}
+
+function getUploadFilename(upload, label) {
+  const filename = upload.filename ?? upload.fileName;
+  return filename == null ? '' : ensureNonEmptyString(filename, `${label}.filename`);
+}
+
+function getUploadMimeType(upload, label) {
+  const mimeType = upload.mime_type ?? upload.mimeType;
+  return mimeType == null ? '' : ensureNonEmptyString(mimeType, `${label}.mime_type`);
+}
+
+function getUploadUrl(upload) {
+  const candidate = upload.url ?? upload.download_url ?? upload.downloadUrl ?? upload.directory;
+  if (typeof candidate !== 'string' || candidate.trim().length === 0) {
+    return null;
+  }
+
+  try {
+    const parsedUrl = new URL(candidate.trim());
+    if (parsedUrl.protocol !== 'http:' && parsedUrl.protocol !== 'https:') {
+      return null;
+    }
+    return parsedUrl.toString();
+  } catch {
+    return null;
+  }
+}
+
+async function fetchUploadBuffer(uploadUrl, label) {
+  let response;
+
+  try {
+    response = await fetch(uploadUrl);
+  } catch (error) {
+    throw new Error(`${label}.directory could not be fetched: ${error.message}`);
+  }
+
+  if (!response.ok) {
+    throw new Error(`${label}.directory returned HTTP ${response.status}.`);
+  }
+
+  const declaredContentLength = Number(response.headers.get('content-length'));
+  if (Number.isFinite(declaredContentLength) && declaredContentLength > MAX_REMOTE_UPLOAD_BYTES) {
+    throw new Error(`${label}.directory exceeds the ${MAX_REMOTE_UPLOAD_BYTES} byte limit.`);
+  }
+
+  const buffer = Buffer.from(await response.arrayBuffer());
+  if (buffer.length > MAX_REMOTE_UPLOAD_BYTES) {
+    throw new Error(`${label}.directory exceeds the ${MAX_REMOTE_UPLOAD_BYTES} byte limit.`);
+  }
+
+  return {
+    buffer,
+    mime_type: String(response.headers.get('content-type') || '').split(';')[0].trim(),
+  };
+}
+
+async function normalizeBinaryUpload(upload, label) {
   if (!upload || typeof upload !== 'object') {
     throw new Error(`${label} must be an object.`);
   }
 
   let buffer;
+  let fetchedMimeType = '';
 
-  if (upload.base64 != null) {
-    const base64Value = ensureNonEmptyString(upload.base64, `${label}.base64`).replace(/\s+/g, '');
+  const uploadBase64Value = getUploadBase64Value(upload);
+  if (uploadBase64Value != null) {
+    const base64Value = ensureNonEmptyString(uploadBase64Value, `${label}.base64`).replace(/\s+/g, '');
     if (!/^[A-Za-z0-9+/]+={0,2}$/.test(base64Value) || base64Value.length % 4 !== 0) {
       throw new Error(`${label}.base64 must be valid base64.`);
     }
 
     buffer = Buffer.from(base64Value, 'base64');
-  } else {
+  } else if (upload.buffer != null) {
     buffer = normalizeBinaryBuffer(upload.buffer, `${label}.buffer`);
+  } else {
+    const uploadUrl = getUploadUrl(upload);
+    if (!uploadUrl) {
+      throw new Error(`${label} must include base64, data, buffer, or a public http(s) URL in directory/url.`);
+    }
+
+    const fetchedUpload = await fetchUploadBuffer(uploadUrl, label);
+    buffer = fetchedUpload.buffer;
+    fetchedMimeType = fetchedUpload.mime_type;
   }
 
   if (buffer.length === 0) {
     throw new Error(`${label} must not be empty.`);
   }
 
-  const filename = upload.filename == null ? '' : ensureNonEmptyString(upload.filename, `${label}.filename`);
-  const mimeType = upload.mime_type == null ? '' : ensureNonEmptyString(upload.mime_type, `${label}.mime_type`);
+  const filename = getUploadFilename(upload, label);
+  const mimeType = getUploadMimeType(upload, label) || fetchedMimeType;
 
   return {
     buffer,
@@ -591,10 +663,18 @@ function getUploadExtension(upload, fallbackExtension) {
 }
 
 async function writeBinaryUploadToTempFile(upload, tempDir, baseName, fallbackExtension) {
-  const normalizedUpload = normalizeBinaryUpload(upload, baseName);
+  const normalizedUpload = await normalizeBinaryUpload(upload, baseName);
   const filePath = path.join(tempDir, `${baseName}${getUploadExtension(normalizedUpload, fallbackExtension)}`);
   await writeFile(filePath, normalizedUpload.buffer);
   return filePath;
+}
+
+export function getGenerateClipDurationSeconds(requestBody) {
+  return normalizePositiveNumber(
+    requestBody.duration_seconds ?? requestBody.durationSeconds ?? requestBody.duration,
+    5,
+    'duration_seconds'
+  );
 }
 
 export async function materializeGenerateClipBinaryInputs(requestBody, tempRoot = tmpdir()) {
@@ -743,7 +823,7 @@ export async function generateClip(requestBody) {
     const imagePath = materializedInputs.image_path;
     const outputPath = path.join(materializedInputs.temp_dir, 'generate-clip.mp4');
     const overlayText = ensureNonEmptyString(requestBody.overlay_text ?? requestBody.overlayText, 'overlay_text');
-    const durationSeconds = normalizePositiveNumber(requestBody.duration_seconds ?? requestBody.durationSeconds, 5, 'duration_seconds');
+    const durationSeconds = getGenerateClipDurationSeconds(requestBody);
     const width = normalizePositiveInteger(requestBody.width, DEFAULT_WIDTH, 'width');
     const height = normalizePositiveInteger(requestBody.height, DEFAULT_HEIGHT, 'height');
     const fps = normalizePositiveInteger(requestBody.fps, DEFAULT_FPS, 'fps');
