@@ -61,7 +61,6 @@ const DEFAULT_AUDIO_SAMPLE_RATE = 48000;
 const DEFAULT_FONT_SIZE = 72;
 const DEFAULT_FONT_COLOR = 'white';
 const DEFAULT_BORDER_COLOR = 'black@0.45';
-const MAX_REMOTE_UPLOAD_BYTES = 64 * 1024 * 1024;
 const GENERATE_CLIP_UPLOAD_DIR_PREFIX = 'ffmpeg-api-generate-clip-';
 const JOIN_CLIPS_UPLOAD_DIR_PREFIX = 'ffmpeg-api-join-clips-';
 const MIME_TYPE_EXTENSIONS = Object.freeze({
@@ -581,18 +580,6 @@ function normalizeAudioSampleRate(value) {
   return normalizePositiveInteger(value, DEFAULT_AUDIO_SAMPLE_RATE, 'audio_sample_rate');
 }
 
-function normalizeBinaryBuffer(value, label) {
-  if (Buffer.isBuffer(value)) {
-    return value;
-  }
-
-  if (value instanceof Uint8Array || value instanceof ArrayBuffer) {
-    return Buffer.from(value);
-  }
-
-  throw new Error(`${label} must be a Buffer, Uint8Array, or ArrayBuffer.`);
-}
-
 function getUploadBase64Field(upload) {
   if (upload.base64 != null) {
     return {
@@ -621,56 +608,9 @@ function getUploadMimeType(upload, label) {
   return mimeType == null ? '' : ensureNonEmptyString(mimeType, `${label}.mime_type`);
 }
 
-function getUploadUrl(upload) {
-  const candidate = upload.url ?? upload.download_url ?? upload.downloadUrl ?? upload.directory;
-  if (typeof candidate !== 'string' || candidate.trim().length === 0) {
-    return null;
-  }
-
-  try {
-    const parsedUrl = new URL(candidate.trim());
-    if (parsedUrl.protocol !== 'http:' && parsedUrl.protocol !== 'https:') {
-      return null;
-    }
-    return parsedUrl.toString();
-  } catch {
-    return null;
-  }
-}
-
-async function fetchUploadBuffer(uploadUrl, label) {
-  let response;
-
-  try {
-    response = await fetch(uploadUrl);
-  } catch (error) {
-    throw new Error(`${label}.directory could not be fetched: ${error.message}`);
-  }
-
-  if (!response.ok) {
-    throw new Error(`${label}.directory returned HTTP ${response.status}.`);
-  }
-
-  const declaredContentLength = Number(response.headers.get('content-length'));
-  if (Number.isFinite(declaredContentLength) && declaredContentLength > MAX_REMOTE_UPLOAD_BYTES) {
-    throw new Error(`${label}.directory exceeds the ${MAX_REMOTE_UPLOAD_BYTES} byte limit.`);
-  }
-
-  const buffer = Buffer.from(await response.arrayBuffer());
-  if (buffer.length > MAX_REMOTE_UPLOAD_BYTES) {
-    throw new Error(`${label}.directory exceeds the ${MAX_REMOTE_UPLOAD_BYTES} byte limit.`);
-  }
-
-  return {
-    buffer,
-    mime_type: String(response.headers.get('content-type') || '').split(';')[0].trim(),
-  };
-}
-
 function normalizeBase64UploadValue(value, label) {
   const rawValue = ensureNonEmptyString(value, label)
     .trim()
-    .replace(/^data:[^,]*;base64,/i, '')
     .replace(/\s+/g, '');
 
   const normalizedValue = rawValue
@@ -698,46 +638,22 @@ async function normalizeBinaryUpload(upload, label) {
     throw new Error(`${label} must be an object.`);
   }
 
-  let buffer;
-  let fetchedMimeType = '';
-  const uploadUrl = getUploadUrl(upload);
-
   const uploadBase64Field = getUploadBase64Field(upload);
-  if (uploadBase64Field != null) {
-    try {
-      buffer = Buffer.from(
-        normalizeBase64UploadValue(uploadBase64Field.value, `${label}.${uploadBase64Field.field}`),
-        'base64'
-      );
-    } catch (error) {
-      if (upload.buffer != null) {
-        buffer = normalizeBinaryBuffer(upload.buffer, `${label}.buffer`);
-      } else if (uploadUrl != null) {
-        const fetchedUpload = await fetchUploadBuffer(uploadUrl, label);
-        buffer = fetchedUpload.buffer;
-        fetchedMimeType = fetchedUpload.mime_type;
-      } else {
-        throw error;
-      }
-    }
-  } else if (upload.buffer != null) {
-    buffer = normalizeBinaryBuffer(upload.buffer, `${label}.buffer`);
-  } else {
-    if (!uploadUrl) {
-      throw new Error(`${label} must include base64, data, buffer, or a public http(s) URL in directory/url.`);
-    }
-
-    const fetchedUpload = await fetchUploadBuffer(uploadUrl, label);
-    buffer = fetchedUpload.buffer;
-    fetchedMimeType = fetchedUpload.mime_type;
+  if (uploadBase64Field == null) {
+    throw new Error(`${label} must include base64 or data.`);
   }
+
+  const buffer = Buffer.from(
+    normalizeBase64UploadValue(uploadBase64Field.value, `${label}.${uploadBase64Field.field}`),
+    'base64'
+  );
 
   if (buffer.length === 0) {
     throw new Error(`${label} must not be empty.`);
   }
 
   const filename = getUploadFilename(upload, label);
-  const mimeType = getUploadMimeType(upload, label) || fetchedMimeType;
+  const mimeType = getUploadMimeType(upload, label);
 
   return {
     buffer,
