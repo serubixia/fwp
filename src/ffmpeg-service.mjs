@@ -700,17 +700,29 @@ async function normalizeBinaryUpload(upload, label) {
 
   let buffer;
   let fetchedMimeType = '';
+  const uploadUrl = getUploadUrl(upload);
 
   const uploadBase64Field = getUploadBase64Field(upload);
   if (uploadBase64Field != null) {
-    buffer = Buffer.from(
-      normalizeBase64UploadValue(uploadBase64Field.value, `${label}.${uploadBase64Field.field}`),
-      'base64'
-    );
+    try {
+      buffer = Buffer.from(
+        normalizeBase64UploadValue(uploadBase64Field.value, `${label}.${uploadBase64Field.field}`),
+        'base64'
+      );
+    } catch (error) {
+      if (upload.buffer != null) {
+        buffer = normalizeBinaryBuffer(upload.buffer, `${label}.buffer`);
+      } else if (uploadUrl != null) {
+        const fetchedUpload = await fetchUploadBuffer(uploadUrl, label);
+        buffer = fetchedUpload.buffer;
+        fetchedMimeType = fetchedUpload.mime_type;
+      } else {
+        throw error;
+      }
+    }
   } else if (upload.buffer != null) {
     buffer = normalizeBinaryBuffer(upload.buffer, `${label}.buffer`);
   } else {
-    const uploadUrl = getUploadUrl(upload);
     if (!uploadUrl) {
       throw new Error(`${label} must include base64, data, buffer, or a public http(s) URL in directory/url.`);
     }
