@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { readFile } from 'node:fs/promises';
 import http from 'node:http';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -13,7 +14,9 @@ import {
 const PORT = Number(process.env.PORT || 3000);
 const MAX_JSON_BODY_BYTES = 1024 * 1024;
 const MAX_GENERATE_CLIP_BODY_BYTES = 64 * 1024 * 1024;
+const MAX_JOIN_CLIPS_BODY_BYTES = 64 * 1024 * 1024;
 const GENERATE_CLIP_JOB_PATH_PATTERN = /^\/v1\/render\/jobs\/([^/]+?)(?:\/(download))?$/;
+const JOIN_CLIPS_JOB_PATH_PATTERN = /^\/v1\/compose\/jobs\/([^/]+?)(?:\/(download))?$/;
 
 function sendJson(response, statusCode, payload, extraHeaders = {}) {
   response.writeHead(statusCode, {
@@ -77,6 +80,16 @@ function buildGenerateClipJobPaths(jobId) {
   };
 }
 
+function buildJoinClipsJobPaths(jobId) {
+  const encodedJobId = encodeURIComponent(jobId);
+  const statusPath = `/v1/compose/jobs/${encodedJobId}`;
+
+  return {
+    status_path: statusPath,
+    download_path: `${statusPath}/download`,
+  };
+}
+
 function buildGenerateClipJobPayload(job) {
   const { result, ...jobWithoutResult } = job;
   const sanitizedResult = result == null
@@ -90,8 +103,30 @@ function buildGenerateClipJobPayload(job) {
   };
 }
 
+function buildJoinClipsJobPayload(job) {
+  const { result, ...jobWithoutResult } = job;
+
+  return {
+    ...jobWithoutResult,
+    ...buildJoinClipsJobPaths(job.job_id),
+    result,
+  };
+}
+
 function matchGenerateClipJobPath(pathname) {
   const match = pathname.match(GENERATE_CLIP_JOB_PATH_PATTERN);
+  if (!match) {
+    return null;
+  }
+
+  return {
+    jobId: decodeURIComponent(match[1]),
+    action: match[2] === 'download' ? 'download' : 'status',
+  };
+}
+
+function matchJoinClipsJobPath(pathname) {
+  const match = pathname.match(JOIN_CLIPS_JOB_PATH_PATTERN);
   if (!match) {
     return null;
   }
@@ -119,6 +154,51 @@ export function createGenerateClipJobStore({ generateClipHandler = generateClip 
 
     try {
       job.result = await generateClipHandler(payload);
+      job.status = 'completed';
+      job.error = null;
+    } catch (error) {
+      job.status = 'failed';
+      job.error = error instanceof Error ? error.message : String(error);
+      job.result = null;
+    } finally {
+      job.completed_at = new Date().toISOString();
+    }
+  }
+
+  return {
+    enqueue(payload) {
+      const job = {
+        job_id: randomUUID(),
+        status: 'queued',
+        created_at: new Date().toISOString(),
+        started_at: null,
+        completed_at: null,
+        error: null,
+        result: null,
+      };
+
+      jobs.set(job.job_id, job);
+      queueMicrotask(() => {
+        void processJob(job, payload);
+      });
+
+      return job;
+    },
+    get(jobId) {
+      return jobs.get(jobId) ?? null;
+    },
+  };
+}
+
+export function createJoinClipsJobStore({ joinVideoClipsHandler = joinVideoClips } = {}) {
+  const jobs = new Map();
+
+  async function processJob(job, payload) {
+    job.status = 'running';
+    job.started_at = new Date().toISOString();
+
+    try {
+      job.result = await joinVideoClipsHandler(payload);
       job.status = 'completed';
       job.error = null;
     } catch (error) {
@@ -323,9 +403,13 @@ export function createServer({
   healthStatusHandler = getHealthStatus,
   presetCatalogHandler = getPresetCatalog,
   generateClipJobStore,
+  joinClipsJobStore,
 } = {}) {
   const effectiveGenerateClipJobStore = generateClipJobStore ?? createGenerateClipJobStore({
     generateClipHandler,
+  });
+  const effectiveJoinClipsJobStore = joinClipsJobStore ?? createJoinClipsJobStore({
+    joinVideoClipsHandler,
   });
 
   return http.createServer(async (request, response) => {
@@ -385,6 +469,50 @@ export function createServer({
         return;
       }
 
+      const joinClipsJobMatch = matchJoinClipsJobPath(url.pathname);
+      if (request.method === 'GET' && joinClipsJobMatch) {
+        const job = effectiveJoinClipsJobStore.get(joinClipsJobMatch.jobId);
+        if (!job) {
+          sendJson(response, 404, {
+            ok: false,
+            error: `Compose job ${joinClipsJobMatch.jobId} was not found.`,
+          });
+          return;
+        }
+
+        if (joinClipsJobMatch.action === 'download') {
+          if (job.status !== 'completed' || job.result == null) {
+            sendJson(response, 409, {
+              ok: false,
+              error: job.status === 'failed'
+                ? job.error || 'Compose job failed.'
+                : 'Compose job is not completed yet.',
+              ...buildJoinClipsJobPayload(job),
+            });
+            return;
+          }
+
+          const outputBuffer = await readFile(job.result.output_path);
+          sendBinary(
+            response,
+            200,
+            outputBuffer,
+            'video/mp4',
+            {
+              'content-disposition': `inline; filename="${path.basename(job.result.output_path)}"`,
+            }
+          );
+          return;
+        }
+
+        sendJson(response, 200, {
+          ok: true,
+          job: 'join_video_clips',
+          ...buildJoinClipsJobPayload(job),
+        });
+        return;
+      }
+
       if (request.method === 'POST' && url.pathname === '/v1/render/generate-clip') {
         const payload = await readGenerateClipBody(request, url);
 
@@ -417,7 +545,23 @@ export function createServer({
       }
 
       if (request.method === 'POST' && url.pathname === '/v1/compose/join-clips') {
-        const payload = await readJsonBody(request);
+        const payload = await readJsonBody(request, MAX_JOIN_CLIPS_BODY_BYTES);
+
+        if (wantsAsyncGenerateClip(url, payload)) {
+          const job = effectiveJoinClipsJobStore.enqueue(payload);
+          const jobPayload = buildJoinClipsJobPayload(job);
+
+          sendJson(response, 202, {
+            ok: true,
+            async: true,
+            job: 'join_video_clips',
+            ...jobPayload,
+          }, {
+            location: jobPayload.status_path,
+          });
+          return;
+        }
+
         sendJson(response, 200, {
           ok: true,
           job: 'join_video_clips',
@@ -436,6 +580,8 @@ export function createServer({
           'GET /v1/render/jobs/<job_id>',
           'GET /v1/render/jobs/<job_id>/download',
           'POST /v1/compose/join-clips',
+          'GET /v1/compose/jobs/<job_id>',
+          'GET /v1/compose/jobs/<job_id>/download',
         ],
       });
     } catch (error) {
