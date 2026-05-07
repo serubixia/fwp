@@ -8,12 +8,14 @@ import {
   getPresetCatalog,
   generateClip,
   joinVideoClips,
+  probeAudioDuration,
 } from './ffmpeg-service.mjs';
 
 const PORT = Number(process.env.PORT || 3000);
 const MAX_JSON_BODY_BYTES = 1024 * 1024;
 const MAX_GENERATE_CLIP_BODY_BYTES = 64 * 1024 * 1024;
 const MAX_JOIN_CLIPS_BODY_BYTES = 64 * 1024 * 1024;
+const MAX_PROBE_AUDIO_BODY_BYTES = 64 * 1024 * 1024;
 const GENERATE_CLIP_JOB_PATH_PATTERN = /^\/v1\/render\/jobs\/([^/]+?)(?:\/(download))?$/;
 const JOIN_CLIPS_JOB_PATH_PATTERN = /^\/v1\/compose\/jobs\/([^/]+?)(?:\/(download))?$/;
 
@@ -361,6 +363,24 @@ async function readGenerateClipBody(request, url) {
   throw new Error('generate-clip only accepts multipart/form-data with binary file fields.');
 }
 
+async function readProbeAudioMultipartBody(request, url) {
+  const formData = await readMultipartFormData(request, url, MAX_PROBE_AUDIO_BODY_BYTES);
+
+  return {
+    audio_binary: await readFormBinaryField(formData, 'audio_binary', { required: true }),
+  };
+}
+
+async function readProbeAudioBody(request, url) {
+  const contentType = getContentType(request);
+
+  if (contentType.includes('multipart/form-data')) {
+    return readProbeAudioMultipartBody(request, url);
+  }
+
+  throw new Error('probe-duration only accepts multipart/form-data with binary file fields.');
+}
+
 function normalizeJoinClipBinaryFieldName(value, index) {
   if (typeof value !== 'string' || value.trim().length === 0) {
     throw new Error(`clips[${index}].clip_binary_field must be a non-empty string.`);
@@ -438,6 +458,7 @@ async function readJoinClipsBody(request, url) {
 export function createServer({
   generateClipHandler = generateClip,
   joinVideoClipsHandler = joinVideoClips,
+  probeAudioDurationHandler = probeAudioDuration,
   healthStatusHandler = getHealthStatus,
   presetCatalogHandler = getPresetCatalog,
   generateClipJobStore,
@@ -461,6 +482,16 @@ export function createServer({
 
       if (request.method === 'GET' && url.pathname === '/v1/presets') {
         sendJson(response, 200, presetCatalogHandler());
+        return;
+      }
+
+      if (request.method === 'POST' && url.pathname === '/v1/audio/probe-duration') {
+        const payload = await readProbeAudioBody(request, url);
+
+        sendJson(response, 200, {
+          ok: true,
+          ...await probeAudioDurationHandler(payload),
+        });
         return;
       }
 
@@ -590,6 +621,7 @@ export function createServer({
         available_routes: [
           'GET /health',
           'GET /v1/presets',
+          'POST /v1/audio/probe-duration',
           'POST /v1/render/generate-clip',
           'GET /v1/render/jobs/<job_id>',
           'GET /v1/render/jobs/<job_id>/download',
