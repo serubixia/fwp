@@ -272,7 +272,12 @@ function buildImageMotionExpressions(sceneAnimation, totalFrames) {
   const lastFrameIndex = Math.max(totalFrames - 1, 1);
   const progress = `on/${lastFrameIndex}`;
   const easedProgress = `(${progress})*(${progress})*(3-2*(${progress}))`;
-  const motionProgress = `0.06*(${progress})+0.94*(${easedProgress})`;
+  const centeredTravelRange = sceneAnimation.speed === 'slow' ? 0.22 : 0.3;
+  const centeredTravelStart = (1 - centeredTravelRange) / 2;
+  const centeredTravelRangeExpression = formatNumber(centeredTravelRange, 3);
+  const centeredTravelStartExpression = formatNumber(centeredTravelStart, 3);
+  const centeredTravelEndExpression = formatNumber(centeredTravelStart + centeredTravelRange, 3);
+  const centeredTravelProgress = `${centeredTravelStartExpression}+${centeredTravelRangeExpression}*${easedProgress}`;
 
   switch (sceneAnimation.image_motion_preset) {
     case 'static_hold':
@@ -282,50 +287,50 @@ function buildImageMotionExpressions(sceneAnimation, totalFrames) {
         y: 'ih/2-(ih/zoom/2)',
       };
     case 'slow_push_in': {
-      const finalZoom = sceneAnimation.speed === 'slow' ? 1.1 : 1.16;
+      const finalZoom = sceneAnimation.speed === 'slow' ? 1.05 : 1.1;
       return {
-        z: `1+${formatNumber(finalZoom - 1)}*${motionProgress}`,
+        z: `1+${formatNumber(finalZoom - 1)}*${easedProgress}`,
         x: 'iw/2-(iw/zoom/2)',
         y: 'ih/2-(ih/zoom/2)',
       };
     }
     case 'slow_pull_out': {
-      const initialZoom = sceneAnimation.speed === 'slow' ? 1.12 : 1.18;
+      const initialZoom = sceneAnimation.speed === 'slow' ? 1.06 : 1.11;
       return {
-        z: `${formatNumber(initialZoom)}-${formatNumber(initialZoom - 1)}*${motionProgress}`,
+        z: `${formatNumber(initialZoom)}-${formatNumber(initialZoom - 1)}*${easedProgress}`,
         x: 'iw/2-(iw/zoom/2)',
         y: 'ih/2-(ih/zoom/2)',
       };
     }
     case 'pan_left_slow':
       return {
-        z: sceneAnimation.speed === 'slow' ? '1.08' : '1.12',
-        x: `(iw-iw/zoom)*${motionProgress}`,
+        z: sceneAnimation.speed === 'slow' ? '1.05' : '1.08',
+        x: `(iw-iw/zoom)*(${centeredTravelProgress})`,
         y: 'ih/2-(ih/zoom/2)',
       };
     case 'pan_right_slow':
       return {
-        z: sceneAnimation.speed === 'slow' ? '1.08' : '1.12',
-        x: `(iw-iw/zoom)*(1-${motionProgress})`,
+        z: sceneAnimation.speed === 'slow' ? '1.05' : '1.08',
+        x: `(iw-iw/zoom)*(${centeredTravelEndExpression}-${centeredTravelRangeExpression}*${easedProgress})`,
         y: 'ih/2-(ih/zoom/2)',
       };
     case 'drift_up_soft':
       return {
-        z: sceneAnimation.speed === 'slow' ? '1.06' : '1.1',
+        z: sceneAnimation.speed === 'slow' ? '1.04' : '1.07',
         x: 'iw/2-(iw/zoom/2)',
-        y: `(ih-ih/zoom)*(1-${motionProgress})`,
+        y: `(ih-ih/zoom)*(${centeredTravelEndExpression}-${centeredTravelRangeExpression}*${easedProgress})`,
       };
     case 'drift_down_soft':
       return {
-        z: sceneAnimation.speed === 'slow' ? '1.06' : '1.1',
+        z: sceneAnimation.speed === 'slow' ? '1.04' : '1.07',
         x: 'iw/2-(iw/zoom/2)',
-        y: `(ih-ih/zoom)*${motionProgress}`,
+        y: `(ih-ih/zoom)*(${centeredTravelProgress})`,
       };
     case 'parallax_float':
       return {
-        z: sceneAnimation.speed === 'slow' ? '1.08' : '1.12',
-        x: '(iw-iw/zoom)*(0.5+0.08*sin(on/12))',
-        y: '(ih-ih/zoom)*(0.48+0.06*cos(on/15))',
+        z: sceneAnimation.speed === 'slow' ? '1.05' : '1.08',
+        x: '(iw-iw/zoom)*(0.5+0.04*sin(on/18))',
+        y: '(ih-ih/zoom)*(0.5+0.03*cos(on/24))',
       };
     default:
       throw new Error(`Unsupported image motion preset: ${sceneAnimation.image_motion_preset}`);
