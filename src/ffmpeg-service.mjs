@@ -600,8 +600,8 @@ export function buildImageTextSceneFilterGraph({
   const normalizedDurationSeconds = normalizePositiveNumber(durationSeconds, 5, 'duration_seconds');
   const normalizedFontSize = normalizePositiveInteger(fontSize, DEFAULT_FONT_SIZE, 'font_size');
   const totalFrames = Math.max(Math.round(normalizedDurationSeconds * normalizedFps), 2);
-  const sourceWidth = Math.ceil(normalizedWidth * 2.5);
-  const sourceHeight = Math.ceil(normalizedHeight * 2.5);
+  const sourceWidth = Math.ceil(normalizedWidth * 4);
+  const sourceHeight = Math.ceil(normalizedHeight * 4);
   const imageMotion = buildImageMotionExpressions(normalizedSceneAnimation, {
     durationSeconds: normalizedDurationSeconds,
     totalFrames,
