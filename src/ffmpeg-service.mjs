@@ -269,28 +269,27 @@ function getTextAnchorYExpression(textAnchor) {
 function buildImageMotionExpressions(sceneAnimation, totalFrames) {
   const lastFrameIndex = Math.max(totalFrames - 1, 1);
   const progress = `on/${lastFrameIndex}`;
+  const easedProgress = `(${progress})*(${progress})*(3-2*(${progress}))`;
 
   switch (sceneAnimation.image_motion_preset) {
     case 'static_hold':
       return {
-        z: '1.03',
+        z: '1.02',
         x: 'iw/2-(iw/zoom/2)',
         y: 'ih/2-(ih/zoom/2)',
       };
     case 'slow_push_in': {
       const finalZoom = sceneAnimation.speed === 'slow' ? 1.1 : 1.16;
-      const step = (finalZoom - 1) / lastFrameIndex;
       return {
-        z: `1+on*${formatNumber(step)}`,
+        z: `1+${formatNumber(finalZoom - 1)}*${easedProgress}`,
         x: 'iw/2-(iw/zoom/2)',
         y: 'ih/2-(ih/zoom/2)',
       };
     }
     case 'slow_pull_out': {
       const initialZoom = sceneAnimation.speed === 'slow' ? 1.12 : 1.18;
-      const step = (initialZoom - 1) / lastFrameIndex;
       return {
-        z: `${formatNumber(initialZoom)}-on*${formatNumber(step)}`,
+        z: `${formatNumber(initialZoom)}-${formatNumber(initialZoom - 1)}*${easedProgress}`,
         x: 'iw/2-(iw/zoom/2)',
         y: 'ih/2-(ih/zoom/2)',
       };
@@ -298,26 +297,26 @@ function buildImageMotionExpressions(sceneAnimation, totalFrames) {
     case 'pan_left_slow':
       return {
         z: sceneAnimation.speed === 'slow' ? '1.08' : '1.12',
-        x: `(iw-iw/zoom)*${progress}`,
+        x: `(iw-iw/zoom)*${easedProgress}`,
         y: 'ih/2-(ih/zoom/2)',
       };
     case 'pan_right_slow':
       return {
         z: sceneAnimation.speed === 'slow' ? '1.08' : '1.12',
-        x: `(iw-iw/zoom)*(1-${progress})`,
+        x: `(iw-iw/zoom)*(1-${easedProgress})`,
         y: 'ih/2-(ih/zoom/2)',
       };
     case 'drift_up_soft':
       return {
         z: sceneAnimation.speed === 'slow' ? '1.06' : '1.1',
         x: 'iw/2-(iw/zoom/2)',
-        y: `(ih-ih/zoom)*(1-${progress})`,
+        y: `(ih-ih/zoom)*(1-${easedProgress})`,
       };
     case 'drift_down_soft':
       return {
         z: sceneAnimation.speed === 'slow' ? '1.06' : '1.1',
         x: 'iw/2-(iw/zoom/2)',
-        y: `(ih-ih/zoom)*${progress}`,
+        y: `(ih-ih/zoom)*${easedProgress}`,
       };
     case 'parallax_float':
       return {
@@ -333,17 +332,22 @@ function buildImageMotionExpressions(sceneAnimation, totalFrames) {
 function buildTextAnimationExpressions(sceneAnimation) {
   const baseX = '(w-text_w)/2';
   const baseY = getTextAnchorYExpression(sceneAnimation.text_anchor);
-  const fadeInAlpha = 'if(lt(t,0.35),t/0.35,1)';
+  const textIntroDurationSeconds = 0.6;
+  const textIntroDuration = formatNumber(textIntroDurationSeconds, 3);
+  const introProgress = `min(t/${textIntroDuration},1)`;
+  const introEase = `(${introProgress})*(${introProgress})*(3-2*(${introProgress}))`;
+  const introRemaining = `(1-${introEase})`;
+  const fadeInAlpha = `if(lt(t,${textIntroDuration}),t/${textIntroDuration},1)`;
 
   switch (sceneAnimation.text_motion_preset) {
     case 'fade_in_hold':
       return { x: baseX, y: baseY, alpha: fadeInAlpha };
     case 'fade_up_soft':
-      return { x: baseX, y: `${baseY}+40/(1+12*t)`, alpha: fadeInAlpha };
+      return { x: baseX, y: `${baseY}+28*${introRemaining}`, alpha: fadeInAlpha };
     case 'slide_left_soft':
-      return { x: `${baseX}+90/(1+14*t)`, y: baseY, alpha: fadeInAlpha };
+      return { x: `${baseX}+60*${introRemaining}`, y: baseY, alpha: fadeInAlpha };
     case 'slide_right_soft':
-      return { x: `${baseX}-90/(1+14*t)`, y: baseY, alpha: fadeInAlpha };
+      return { x: `${baseX}-60*${introRemaining}`, y: baseY, alpha: fadeInAlpha };
     case 'type_on_soft':
       return { x: baseX, y: baseY, alpha: 'if(lt(t,0.12),0,if(lt(t,0.6),(t-0.12)/0.48,1))' };
     default:
