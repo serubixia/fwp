@@ -765,6 +765,12 @@ export async function materializeJoinClipsInputs(requestBody, tempRoot = tmpdir(
     : null;
 
   try {
+    normalizedClipEntries.forEach((clip, index) => {
+      if (clip.clip_binary != null && clip.clip_binary.buffer == null) {
+        throw new Error(`clips[${index}].clip_binary must be sent as an n8n binary file upload.`);
+      }
+    });
+
     return {
       temp_dir: tempDir,
       clips: await Promise.all(normalizedClipEntries.map(async (clip, index) => ({
@@ -968,10 +974,12 @@ export async function joinVideoClips(requestBody) {
   }
 
   const materializedInputs = await materializeJoinClipsInputs(requestBody);
+  const outputDir = materializedInputs.temp_dir ?? await mkdtemp(path.join(tmpdir(), JOIN_CLIPS_UPLOAD_DIR_PREFIX));
+  const ownsOutputDir = materializedInputs.temp_dir == null;
 
   try {
     const clips = materializedInputs.clips;
-    const outputPath = resolveWorkspacePath(requestBody.output_path ?? requestBody.outputPath, 'output_path');
+    const outputPath = path.join(outputDir, 'join-clips.mp4');
     const width = normalizePositiveInteger(requestBody.width, DEFAULT_WIDTH, 'width');
     const height = normalizePositiveInteger(requestBody.height, DEFAULT_HEIGHT, 'height');
     const fps = normalizePositiveInteger(requestBody.fps, DEFAULT_FPS, 'fps');
@@ -1010,8 +1018,12 @@ export async function joinVideoClips(requestBody) {
       outputPath,
     ]);
 
+    const outputBuffer = await readFile(outputPath);
+
     return {
-      output_path: outputPath,
+      buffer: outputBuffer,
+      content_type: 'video/mp4',
+      filename: 'join-clips.mp4',
       total_duration_seconds: totalDurationSeconds,
       width,
       height,
@@ -1023,6 +1035,9 @@ export async function joinVideoClips(requestBody) {
     };
   } finally {
     await materializedInputs.cleanup();
+    if (ownsOutputDir) {
+      await rm(outputDir, { recursive: true, force: true });
+    }
   }
 }
 
