@@ -3,6 +3,8 @@ import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 
+import { logError, logInfo } from './logger.mjs';
+
 export const SCENE_IMAGE_MOTION_PRESETS = Object.freeze([
   'static_hold',
   'slow_push_in',
@@ -157,6 +159,14 @@ function escapeExpression(value) {
 }
 
 async function runCommand(binary, args) {
+  const startedAt = Date.now();
+  const commandPreview = `${binary} ${args.join(' ')}`;
+
+  logInfo('process.command.started', {
+    binary,
+    command: commandPreview.length > 1200 ? `${commandPreview.slice(0, 1197)}...` : commandPreview,
+  });
+
   return new Promise((resolve, reject) => {
     const child = spawn(binary, args, {
       stdio: ['ignore', 'pipe', 'pipe'],
@@ -174,14 +184,33 @@ async function runCommand(binary, args) {
     });
 
     child.on('error', (error) => {
+      logError('process.command.spawn_failed', {
+        binary,
+        duration_ms: Date.now() - startedAt,
+        error: error.message,
+      });
       reject(error);
     });
 
     child.on('close', (code) => {
       if (code === 0) {
+        logInfo('process.command.completed', {
+          binary,
+          duration_ms: Date.now() - startedAt,
+          stdout_bytes: Buffer.byteLength(stdout),
+          stderr_bytes: Buffer.byteLength(stderr),
+        });
         resolve({ stdout, stderr });
         return;
       }
+
+      logError('process.command.failed', {
+        binary,
+        duration_ms: Date.now() - startedAt,
+        exit_code: code,
+        stderr_excerpt: stderr.trim().length > 1200 ? `...${stderr.trim().slice(-1197)}` : stderr.trim() || undefined,
+        stdout_excerpt: stdout.trim().length > 1200 ? `...${stdout.trim().slice(-1197)}` : stdout.trim() || undefined,
+      });
 
       reject(new Error([
         `${binary} exited with code ${code}.`,
@@ -505,6 +534,68 @@ export function buildJoinClipsFilterGraph({
   };
 }
 
+export function buildJoinClipsAudioFilterGraph({
+  clips,
+  durations,
+  audioTracks,
+  audioSampleRate = DEFAULT_AUDIO_SAMPLE_RATE,
+}) {
+  if (!Array.isArray(clips) || clips.length === 0) {
+    throw new Error('clips must be a non-empty array.');
+  }
+
+  if (!Array.isArray(durations) || durations.length !== clips.length) {
+    throw new Error('durations must be an array with the same length as clips.');
+  }
+
+  if (!Array.isArray(audioTracks) || audioTracks.length !== clips.length) {
+    throw new Error('audioTracks must be an array with the same length as clips.');
+  }
+
+  const normalizedClips = clips.map(normalizeClipEntry);
+  const normalizedDurations = durations.map((duration, index) => normalizePositiveNumber(duration, null, `durations[${index}]`));
+  const normalizedAudioSampleRate = normalizePositiveInteger(audioSampleRate, DEFAULT_AUDIO_SAMPLE_RATE, 'audio_sample_rate');
+  const filterParts = [];
+  const inputLabels = [];
+  let totalDurationSeconds = 0;
+
+  normalizedClips.forEach((clip, index) => {
+    const segmentDuration = index === normalizedClips.length - 1
+      ? normalizedDurations[index]
+      : normalizedDurations[index] - clip.transition_to_next.duration_seconds;
+
+    if (!Number.isFinite(segmentDuration) || segmentDuration <= 0) {
+      throw new Error(`Audio segment ${index} must have a positive duration after transition trimming.`);
+    }
+
+    const normalizedSegmentDuration = formatNumber(segmentDuration, 3);
+    const outputLabel = `a${index}`;
+
+    if (audioTracks[index]) {
+      filterParts.push(
+        `[${index}:a]aresample=${normalizedAudioSampleRate},aformat=sample_rates=${normalizedAudioSampleRate}:channel_layouts=stereo,apad=whole_dur=${normalizedSegmentDuration},atrim=duration=${normalizedSegmentDuration},asetpts=PTS-STARTPTS[${outputLabel}]`
+      );
+    } else {
+      filterParts.push(
+        `anullsrc=r=${normalizedAudioSampleRate}:cl=stereo,atrim=duration=${normalizedSegmentDuration},asetpts=PTS-STARTPTS[${outputLabel}]`
+      );
+    }
+
+    inputLabels.push(`[${outputLabel}]`);
+    totalDurationSeconds += segmentDuration;
+  });
+
+  if (inputLabels.length > 1) {
+    filterParts.push(`${inputLabels.join('')}concat=n=${inputLabels.length}:v=0:a=1[aout]`);
+  }
+
+  return {
+    filterGraph: filterParts.join(';'),
+    outputLabel: inputLabels.length > 1 ? 'aout' : 'a0',
+    totalDurationSeconds: Number(formatNumber(totalDurationSeconds, 3)),
+  };
+}
+
 async function probeClipDuration(clipPath) {
   const { stdout } = await runCommand('ffprobe', [
     '-v',
@@ -523,6 +614,35 @@ async function probeClipDuration(clipPath) {
   }
 
   return durationSeconds;
+}
+
+async function probeClipStreamInfo(clipPath) {
+  const { stdout } = await runCommand('ffprobe', [
+    '-v',
+    'error',
+    '-show_entries',
+    'stream=codec_type,duration',
+    '-show_entries',
+    'format=duration',
+    '-of',
+    'json',
+    clipPath,
+  ]);
+
+  const probeResult = JSON.parse(stdout);
+  const streams = Array.isArray(probeResult.streams) ? probeResult.streams : [];
+  const videoStream = streams.find((stream) => stream.codec_type === 'video');
+  const audioStream = streams.find((stream) => stream.codec_type === 'audio');
+  const videoDurationSeconds = Number.parseFloat(videoStream?.duration ?? probeResult.format?.duration ?? '');
+
+  if (!Number.isFinite(videoDurationSeconds) || videoDurationSeconds <= 0) {
+    throw new Error(`Could not determine video duration for ${clipPath}.`);
+  }
+
+  return {
+    video_duration_seconds: videoDurationSeconds,
+    has_audio: audioStream != null,
+  };
 }
 
 function normalizeCodec(codec) {
@@ -852,6 +972,10 @@ export async function probeAudioDuration(requestBody) {
     throw new Error('The request body must be an object.');
   }
 
+  logInfo('audio.probe.started', {
+    filename: requestBody.audio_binary?.filename ?? requestBody.audio_binary?.fileName,
+  });
+
   const materializedInput = await materializeProbeAudioBinaryInput(requestBody);
 
   try {
@@ -867,6 +991,9 @@ export async function probeAudioDuration(requestBody) {
       mime_type: materializedInput.mime_type,
     };
   } finally {
+    logInfo('audio.probe.completed', {
+      filename: materializedInput?.filename,
+    });
     await materializedInput?.cleanup?.();
   }
 }
@@ -973,6 +1100,58 @@ export function buildGenerateClipFfmpegArgs({
   return args;
 }
 
+export function buildJoinClipsFfmpegArgs({
+  clips,
+  filterGraph,
+  outputLabel,
+  outputPath,
+  videoCodec,
+  encodePreset,
+  crf,
+  audio = null,
+}) {
+  const args = [
+    '-y',
+    ...clips.flatMap((clip) => ['-i', clip.clip_path]),
+    '-filter_complex',
+    filterGraph,
+    '-map',
+    `[${outputLabel}]`,
+  ];
+
+  if (audio) {
+    args.push(
+      '-map',
+      `[${audio.outputLabel}]`,
+      '-c:a',
+      audio.audio_codec,
+      '-b:a',
+      audio.audio_bitrate,
+      '-ar',
+      String(audio.audio_sample_rate),
+      '-shortest'
+    );
+  } else {
+    args.push('-an');
+  }
+
+  args.push(
+    '-c:v',
+    videoCodec,
+    '-preset',
+    encodePreset,
+    '-crf',
+    String(crf),
+    '-pix_fmt',
+    'yuv420p',
+    '-movflags',
+    '+faststart',
+    outputPath,
+  );
+
+  return args;
+}
+
 export async function generateClip(requestBody) {
   if (!requestBody || typeof requestBody !== 'object') {
     throw new Error('The request body must be an object.');
@@ -1014,6 +1193,20 @@ export async function generateClip(requestBody) {
       borderColor,
     });
 
+    logInfo('render.generate_clip.started', {
+      duration_seconds: Number(formatNumber(durationSeconds, 3)),
+      width,
+      height,
+      fps,
+      has_voiceover: audio != null,
+      scene_animation: {
+        image_motion_preset: sceneAnimation.image_motion_preset,
+        text_motion_preset: sceneAnimation.text_motion_preset,
+        speed: sceneAnimation.speed,
+        text_anchor: sceneAnimation.text_anchor,
+      },
+    });
+
     await mkdir(path.dirname(outputPath), { recursive: true });
 
     await runCommand('ffmpeg', buildGenerateClipFfmpegArgs({
@@ -1029,6 +1222,16 @@ export async function generateClip(requestBody) {
     }));
 
     const outputBuffer = await readFile(outputPath);
+
+    logInfo('render.generate_clip.completed', {
+      duration_seconds: Number(formatNumber(durationSeconds, 3)),
+      width,
+      height,
+      fps,
+      has_voiceover: audio != null,
+      output_filename: 'generate-clip.mp4',
+      output_size_bytes: outputBuffer.length,
+    });
 
     return {
       buffer: outputBuffer,
@@ -1063,7 +1266,16 @@ export async function joinVideoClips(requestBody) {
     const fps = normalizePositiveInteger(requestBody.fps, DEFAULT_FPS, 'fps');
     const videoCodec = normalizeCodec(requestBody.video_codec ?? requestBody.videoCodec);
     const crf = normalizeCrf(requestBody.crf);
-    const durations = await Promise.all(clips.map((clip) => probeClipDuration(clip.clip_path)));
+
+    logInfo('compose.join_clips.started', {
+      clip_count: clips.length,
+      width,
+      height,
+      fps,
+    });
+
+    const clipStreamInfos = await Promise.all(clips.map((clip) => probeClipStreamInfo(clip.clip_path)));
+    const durations = clipStreamInfos.map((clipInfo) => clipInfo.video_duration_seconds);
     const { filterGraph, outputLabel, totalDurationSeconds } = buildJoinClipsFilterGraph({
       clips,
       durations,
@@ -1071,32 +1283,54 @@ export async function joinVideoClips(requestBody) {
       height,
       fps,
     });
+    const hasAudio = clipStreamInfos.some((clipInfo) => clipInfo.has_audio);
+    const audioGraph = hasAudio
+      ? buildJoinClipsAudioFilterGraph({
+        clips,
+        durations,
+        audioTracks: clipStreamInfos.map((clipInfo) => clipInfo.has_audio),
+      })
+      : null;
+
+    logInfo('compose.join_clips.audio_plan', {
+      clip_count: clips.length,
+      video_durations_seconds: durations.map((duration) => Number(formatNumber(duration, 3))),
+      audio_tracks: clipStreamInfos.map((clipInfo) => clipInfo.has_audio),
+      has_audio: hasAudio,
+    });
+
     const encodePreset = getAdaptiveEncodePreset(requestBody.encode_preset ?? requestBody.encodePreset, totalDurationSeconds);
 
     await mkdir(path.dirname(outputPath), { recursive: true });
 
-    await runCommand('ffmpeg', [
-      '-y',
-      ...clips.flatMap((clip) => ['-i', clip.clip_path]),
-      '-filter_complex',
-      filterGraph,
-      '-map',
-      `[${outputLabel}]`,
-      '-an',
-      '-c:v',
-      videoCodec,
-      '-preset',
-      encodePreset,
-      '-crf',
-      String(crf),
-      '-pix_fmt',
-      'yuv420p',
-      '-movflags',
-      '+faststart',
+    await runCommand('ffmpeg', buildJoinClipsFfmpegArgs({
+      clips,
+      filterGraph: audioGraph == null ? filterGraph : `${filterGraph};${audioGraph.filterGraph}`,
+      outputLabel,
       outputPath,
-    ]);
+      videoCodec,
+      encodePreset,
+      crf,
+      audio: audioGraph == null ? null : {
+        outputLabel: audioGraph.outputLabel,
+        audio_codec: DEFAULT_AUDIO_CODEC,
+        audio_bitrate: DEFAULT_AUDIO_BITRATE,
+        audio_sample_rate: DEFAULT_AUDIO_SAMPLE_RATE,
+      },
+    }));
 
     const outputBuffer = await readFile(outputPath);
+
+    logInfo('compose.join_clips.completed', {
+      clip_count: clips.length,
+      total_duration_seconds: totalDurationSeconds,
+      width,
+      height,
+      fps,
+      has_audio: hasAudio,
+      output_filename: 'join-clips.mp4',
+      output_size_bytes: outputBuffer.length,
+    });
 
     return {
       buffer: outputBuffer,
@@ -1106,6 +1340,7 @@ export async function joinVideoClips(requestBody) {
       width,
       height,
       fps,
+      has_audio: hasAudio,
       clips: clips.map((clip) => ({
         clip_path: clip.clip_path,
         transition_to_next: clip.transition_to_next,
