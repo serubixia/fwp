@@ -1,5 +1,6 @@
 import { spawn } from 'node:child_process';
-import { mkdir } from 'node:fs/promises';
+import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
 import path from 'node:path';
 
 export const SCENE_IMAGE_MOTION_PRESETS = Object.freeze([
@@ -58,6 +59,18 @@ const DEFAULT_AUDIO_SAMPLE_RATE = 48000;
 const DEFAULT_FONT_SIZE = 72;
 const DEFAULT_FONT_COLOR = 'white';
 const DEFAULT_BORDER_COLOR = 'black@0.45';
+const GENERATE_CLIP_UPLOAD_DIR_PREFIX = 'ffmpeg-api-generate-clip-';
+const MIME_TYPE_EXTENSIONS = Object.freeze({
+  'image/png': '.png',
+  'image/jpeg': '.jpg',
+  'image/webp': '.webp',
+  'audio/wav': '.wav',
+  'audio/x-wav': '.wav',
+  'audio/mpeg': '.mp3',
+  'audio/mp4': '.m4a',
+  'audio/aac': '.aac',
+  'audio/ogg': '.ogg',
+});
 
 function formatNumber(value, digits = 6) {
   return Number(value.toFixed(digits)).toString();
@@ -524,14 +537,104 @@ function normalizeAudioSampleRate(value) {
   return normalizePositiveInteger(value, DEFAULT_AUDIO_SAMPLE_RATE, 'audio_sample_rate');
 }
 
-function normalizeGenerateClipAudio(requestBody, durationSeconds) {
-  const voiceoverPathValue = requestBody.voiceover_path ?? requestBody.voiceoverPath;
-  if (voiceoverPathValue == null) {
+function normalizeBinaryBuffer(value, label) {
+  if (Buffer.isBuffer(value)) {
+    return value;
+  }
+
+  if (value instanceof Uint8Array || value instanceof ArrayBuffer) {
+    return Buffer.from(value);
+  }
+
+  throw new Error(`${label} must be a Buffer, Uint8Array, or ArrayBuffer.`);
+}
+
+function normalizeBinaryUpload(upload, label) {
+  if (!upload || typeof upload !== 'object') {
+    throw new Error(`${label} must be an object.`);
+  }
+
+  let buffer;
+
+  if (upload.base64 != null) {
+    const base64Value = ensureNonEmptyString(upload.base64, `${label}.base64`).replace(/\s+/g, '');
+    if (!/^[A-Za-z0-9+/]+={0,2}$/.test(base64Value) || base64Value.length % 4 !== 0) {
+      throw new Error(`${label}.base64 must be valid base64.`);
+    }
+
+    buffer = Buffer.from(base64Value, 'base64');
+  } else {
+    buffer = normalizeBinaryBuffer(upload.buffer, `${label}.buffer`);
+  }
+
+  if (buffer.length === 0) {
+    throw new Error(`${label} must not be empty.`);
+  }
+
+  const filename = upload.filename == null ? '' : ensureNonEmptyString(upload.filename, `${label}.filename`);
+  const mimeType = upload.mime_type == null ? '' : ensureNonEmptyString(upload.mime_type, `${label}.mime_type`);
+
+  return {
+    buffer,
+    filename,
+    mime_type: mimeType,
+  };
+}
+
+function getUploadExtension(upload, fallbackExtension) {
+  const fileExtension = path.extname(path.basename(upload.filename || '')).toLowerCase();
+  if (fileExtension) {
+    return fileExtension;
+  }
+
+  return MIME_TYPE_EXTENSIONS[upload.mime_type] || fallbackExtension;
+}
+
+async function writeBinaryUploadToTempFile(upload, tempDir, baseName, fallbackExtension) {
+  const normalizedUpload = normalizeBinaryUpload(upload, baseName);
+  const filePath = path.join(tempDir, `${baseName}${getUploadExtension(normalizedUpload, fallbackExtension)}`);
+  await writeFile(filePath, normalizedUpload.buffer);
+  return filePath;
+}
+
+export async function materializeGenerateClipBinaryInputs(requestBody, tempRoot = tmpdir()) {
+  const imageBinary = requestBody.image_binary ?? requestBody.imageBinary;
+  const voiceoverBinary = requestBody.voiceover_binary ?? requestBody.voiceoverBinary;
+
+  if (imageBinary == null && voiceoverBinary == null) {
+    return null;
+  }
+
+  const tempDir = await mkdtemp(path.join(tempRoot, GENERATE_CLIP_UPLOAD_DIR_PREFIX));
+
+  try {
+    return {
+      temp_dir: tempDir,
+      image_path: imageBinary == null
+        ? null
+        : await writeBinaryUploadToTempFile(imageBinary, tempDir, 'image-upload', '.png'),
+      voiceover_path: voiceoverBinary == null
+        ? null
+        : await writeBinaryUploadToTempFile(voiceoverBinary, tempDir, 'voiceover-upload', '.wav'),
+      cleanup: async () => {
+        await rm(tempDir, { recursive: true, force: true });
+      },
+    };
+  } catch (error) {
+    await rm(tempDir, { recursive: true, force: true });
+    throw error;
+  }
+}
+
+function normalizeGenerateClipAudio(requestBody, durationSeconds, materializedInputs) {
+  const materializedVoiceoverPath = materializedInputs?.voiceover_path ?? null;
+
+  if (materializedVoiceoverPath == null) {
     return null;
   }
 
   return {
-    voiceover_path: resolveWorkspacePath(voiceoverPathValue, 'voiceover_path'),
+    voiceover_path: materializedVoiceoverPath,
     voiceover_mix: normalizeVoiceoverMix(requestBody.voiceover_mix ?? requestBody.voiceoverMix, durationSeconds),
     audio_codec: normalizeAudioCodec(requestBody.audio_codec ?? requestBody.audioCodec),
     audio_bitrate: normalizeAudioBitrate(requestBody.audio_bitrate ?? requestBody.audioBitrate),
@@ -630,66 +733,72 @@ export async function generateClip(requestBody) {
     throw new Error('The request body must be an object.');
   }
 
-  const imagePath = resolveWorkspacePath(requestBody.image_path ?? requestBody.imagePath, 'image_path');
-  const outputPath = resolveWorkspacePath(requestBody.output_path ?? requestBody.outputPath, 'output_path');
-  const overlayText = ensureNonEmptyString(requestBody.overlay_text ?? requestBody.overlayText, 'overlay_text');
-  const durationSeconds = normalizePositiveNumber(requestBody.duration_seconds ?? requestBody.durationSeconds, 5, 'duration_seconds');
-  const width = normalizePositiveInteger(requestBody.width, DEFAULT_WIDTH, 'width');
-  const height = normalizePositiveInteger(requestBody.height, DEFAULT_HEIGHT, 'height');
-  const fps = normalizePositiveInteger(requestBody.fps, DEFAULT_FPS, 'fps');
-  const fontSize = normalizePositiveInteger(requestBody.font_size ?? requestBody.fontSize, DEFAULT_FONT_SIZE, 'font_size');
-  const fontColor = normalizeOptionalString(requestBody.font_color ?? requestBody.fontColor, DEFAULT_FONT_COLOR);
-  const borderColor = normalizeOptionalString(requestBody.border_color ?? requestBody.borderColor, DEFAULT_BORDER_COLOR);
-  const fontFile = normalizeOptionalString(requestBody.font_file ?? requestBody.fontFile, process.env.FONT_FILE || '/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf');
-  const sceneAnimation = validateSceneAnimation(requestBody.scene_animation ?? requestBody.sceneAnimation);
-  const videoCodec = normalizeCodec(requestBody.video_codec ?? requestBody.videoCodec);
-  const encodePreset = normalizeEncodePreset(requestBody.encode_preset ?? requestBody.encodePreset);
-  const crf = normalizeCrf(requestBody.crf);
-  const audio = normalizeGenerateClipAudio(requestBody, durationSeconds);
-  const filterGraph = buildImageTextSceneFilterGraph({
-    sceneAnimation,
-    overlayText,
-    width,
-    height,
-    fps,
-    durationSeconds,
-    fontFile,
-    fontSize,
-    fontColor,
-    borderColor,
-  });
+  const materializedInputs = await materializeGenerateClipBinaryInputs(requestBody);
 
-  await mkdir(path.dirname(outputPath), { recursive: true });
+  try {
+    if (materializedInputs?.image_path == null) {
+      throw new Error('image_binary is required.');
+    }
 
-  await runCommand('ffmpeg', buildGenerateClipFfmpegArgs({
-    imagePath,
-    outputPath,
-    filterGraph,
-    durationSeconds,
-    fps,
-    videoCodec,
-    encodePreset,
-    crf,
-    audio,
-  }));
+    const imagePath = materializedInputs.image_path;
+    const outputPath = path.join(materializedInputs.temp_dir, 'generate-clip.mp4');
+    const overlayText = ensureNonEmptyString(requestBody.overlay_text ?? requestBody.overlayText, 'overlay_text');
+    const durationSeconds = normalizePositiveNumber(requestBody.duration_seconds ?? requestBody.durationSeconds, 5, 'duration_seconds');
+    const width = normalizePositiveInteger(requestBody.width, DEFAULT_WIDTH, 'width');
+    const height = normalizePositiveInteger(requestBody.height, DEFAULT_HEIGHT, 'height');
+    const fps = normalizePositiveInteger(requestBody.fps, DEFAULT_FPS, 'fps');
+    const fontSize = normalizePositiveInteger(requestBody.font_size ?? requestBody.fontSize, DEFAULT_FONT_SIZE, 'font_size');
+    const fontColor = normalizeOptionalString(requestBody.font_color ?? requestBody.fontColor, DEFAULT_FONT_COLOR);
+    const borderColor = normalizeOptionalString(requestBody.border_color ?? requestBody.borderColor, DEFAULT_BORDER_COLOR);
+    const fontFile = normalizeOptionalString(requestBody.font_file ?? requestBody.fontFile, process.env.FONT_FILE || '/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf');
+    const sceneAnimation = validateSceneAnimation(requestBody.scene_animation ?? requestBody.sceneAnimation);
+    const videoCodec = normalizeCodec(requestBody.video_codec ?? requestBody.videoCodec);
+    const encodePreset = normalizeEncodePreset(requestBody.encode_preset ?? requestBody.encodePreset);
+    const crf = normalizeCrf(requestBody.crf);
+    const audio = normalizeGenerateClipAudio(requestBody, durationSeconds, materializedInputs);
+    const filterGraph = buildImageTextSceneFilterGraph({
+      sceneAnimation,
+      overlayText,
+      width,
+      height,
+      fps,
+      durationSeconds,
+      fontFile,
+      fontSize,
+      fontColor,
+      borderColor,
+    });
 
-  return {
-    output_path: outputPath,
-    duration_seconds: Number(formatNumber(durationSeconds, 3)),
-    width,
-    height,
-    fps,
-    voiceover: audio
-      ? {
-          voiceover_path: audio.voiceover_path,
-          voiceover_mix: audio.voiceover_mix,
-          audio_codec: audio.audio_codec,
-          audio_bitrate: audio.audio_bitrate,
-          audio_sample_rate: audio.audio_sample_rate,
-        }
-      : null,
-    scene_animation: sceneAnimation,
-  };
+    await mkdir(path.dirname(outputPath), { recursive: true });
+
+    await runCommand('ffmpeg', buildGenerateClipFfmpegArgs({
+      imagePath,
+      outputPath,
+      filterGraph,
+      durationSeconds,
+      fps,
+      videoCodec,
+      encodePreset,
+      crf,
+      audio,
+    }));
+
+    const outputBuffer = await readFile(outputPath);
+
+    return {
+      buffer: outputBuffer,
+      content_type: 'video/mp4',
+      filename: 'generate-clip.mp4',
+      duration_seconds: Number(formatNumber(durationSeconds, 3)),
+      width,
+      height,
+      fps,
+      has_voiceover: audio != null,
+      scene_animation: sceneAnimation,
+    };
+  } finally {
+    await materializedInputs?.cleanup?.();
+  }
 }
 
 export async function joinVideoClips(requestBody) {
