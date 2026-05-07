@@ -63,6 +63,7 @@ const DEFAULT_FONT_COLOR = 'white';
 const DEFAULT_BORDER_COLOR = 'black@0.45';
 const MAX_REMOTE_UPLOAD_BYTES = 64 * 1024 * 1024;
 const GENERATE_CLIP_UPLOAD_DIR_PREFIX = 'ffmpeg-api-generate-clip-';
+const JOIN_CLIPS_UPLOAD_DIR_PREFIX = 'ffmpeg-api-join-clips-';
 const MIME_TYPE_EXTENSIONS = Object.freeze({
   'image/png': '.png',
   'image/jpeg': '.jpg',
@@ -73,6 +74,10 @@ const MIME_TYPE_EXTENSIONS = Object.freeze({
   'audio/mp4': '.m4a',
   'audio/aac': '.aac',
   'audio/ogg': '.ogg',
+  'video/mp4': '.mp4',
+  'video/quicktime': '.mov',
+  'video/webm': '.webm',
+  'video/x-matroska': '.mkv',
 });
 
 function formatNumber(value, digits = 6) {
@@ -397,6 +402,32 @@ function normalizeClipEntry(clip, index) {
   };
 }
 
+function normalizeJoinClipsRequestEntry(clip, index) {
+  if (!clip || typeof clip !== 'object') {
+    throw new Error(`clips[${index}] must be an object.`);
+  }
+
+  const clipPath = clip.clip_path ?? clip.path;
+  const clipBinary = clip.clip_binary ?? clip.clipBinary;
+
+  if (clipPath == null && clipBinary == null) {
+    throw new Error(`clips[${index}] must include clip_path or clip_binary.`);
+  }
+
+  if (clipPath != null && clipBinary != null) {
+    throw new Error(`clips[${index}] must not include both clip_path and clip_binary.`);
+  }
+
+  return {
+    clip_path: clipPath == null ? null : ensureNonEmptyString(clipPath, `clips[${index}].clip_path`),
+    clip_binary: clipBinary ?? null,
+    transition_to_next: validateSceneTransition(
+      clip.transition_to_next,
+      { label: `clips[${index}].transition_to_next` }
+    ),
+  };
+}
+
 export function buildJoinClipsFilterGraph({
   clips,
   durations,
@@ -562,8 +593,22 @@ function normalizeBinaryBuffer(value, label) {
   throw new Error(`${label} must be a Buffer, Uint8Array, or ArrayBuffer.`);
 }
 
-function getUploadBase64Value(upload) {
-  return upload.base64 ?? upload.data;
+function getUploadBase64Field(upload) {
+  if (upload.base64 != null) {
+    return {
+      field: 'base64',
+      value: upload.base64,
+    };
+  }
+
+  if (upload.data != null) {
+    return {
+      field: 'data',
+      value: upload.data,
+    };
+  }
+
+  return null;
 }
 
 function getUploadFilename(upload, label) {
@@ -622,6 +667,32 @@ async function fetchUploadBuffer(uploadUrl, label) {
   };
 }
 
+function normalizeBase64UploadValue(value, label) {
+  const rawValue = ensureNonEmptyString(value, label)
+    .trim()
+    .replace(/^data:[^;,]+;base64,/i, '')
+    .replace(/\s+/g, '');
+
+  const normalizedValue = rawValue
+    .replace(/-/g, '+')
+    .replace(/_/g, '/');
+
+  if (!/^[A-Za-z0-9+/]*={0,2}$/.test(normalizedValue)) {
+    throw new Error(`${label} must be valid base64.`);
+  }
+
+  const remainder = normalizedValue.length % 4;
+  if (remainder === 1) {
+    throw new Error(`${label} must be valid base64.`);
+  }
+
+  if (remainder === 0) {
+    return normalizedValue;
+  }
+
+  return normalizedValue.padEnd(normalizedValue.length + (4 - remainder), '=');
+}
+
 async function normalizeBinaryUpload(upload, label) {
   if (!upload || typeof upload !== 'object') {
     throw new Error(`${label} must be an object.`);
@@ -630,14 +701,12 @@ async function normalizeBinaryUpload(upload, label) {
   let buffer;
   let fetchedMimeType = '';
 
-  const uploadBase64Value = getUploadBase64Value(upload);
-  if (uploadBase64Value != null) {
-    const base64Value = ensureNonEmptyString(uploadBase64Value, `${label}.base64`).replace(/\s+/g, '');
-    if (!/^[A-Za-z0-9+/]+={0,2}$/.test(base64Value) || base64Value.length % 4 !== 0) {
-      throw new Error(`${label}.base64 must be valid base64.`);
-    }
-
-    buffer = Buffer.from(base64Value, 'base64');
+  const uploadBase64Field = getUploadBase64Field(upload);
+  if (uploadBase64Field != null) {
+    buffer = Buffer.from(
+      normalizeBase64UploadValue(uploadBase64Field.value, `${label}.${uploadBase64Field.field}`),
+      'base64'
+    );
   } else if (upload.buffer != null) {
     buffer = normalizeBinaryBuffer(upload.buffer, `${label}.buffer`);
   } else {
@@ -714,6 +783,44 @@ export async function materializeGenerateClipBinaryInputs(requestBody, tempRoot 
     };
   } catch (error) {
     await rm(tempDir, { recursive: true, force: true });
+    throw error;
+  }
+}
+
+export async function materializeJoinClipsInputs(requestBody, tempRoot = tmpdir()) {
+  if (!requestBody || typeof requestBody !== 'object') {
+    throw new Error('The request body must be an object.');
+  }
+
+  if (!Array.isArray(requestBody.clips) || requestBody.clips.length === 0) {
+    throw new Error('clips must be a non-empty array.');
+  }
+
+  const normalizedClipEntries = requestBody.clips.map((clip, index) => normalizeJoinClipsRequestEntry(clip, index));
+  const needsTempDir = normalizedClipEntries.some((clip) => clip.clip_binary != null);
+  const tempDir = needsTempDir
+    ? await mkdtemp(path.join(tempRoot, JOIN_CLIPS_UPLOAD_DIR_PREFIX))
+    : null;
+
+  try {
+    return {
+      temp_dir: tempDir,
+      clips: await Promise.all(normalizedClipEntries.map(async (clip, index) => ({
+        clip_path: clip.clip_binary == null
+          ? resolveWorkspacePath(clip.clip_path, `clips[${index}].clip_path`)
+          : await writeBinaryUploadToTempFile(clip.clip_binary, tempDir, `clip-${String(index + 1).padStart(2, '0')}`, '.mp4'),
+        transition_to_next: clip.transition_to_next,
+      }))),
+      cleanup: async () => {
+        if (tempDir != null) {
+          await rm(tempDir, { recursive: true, force: true });
+        }
+      },
+    };
+  } catch (error) {
+    if (tempDir != null) {
+      await rm(tempDir, { recursive: true, force: true });
+    }
     throw error;
   }
 }
@@ -898,68 +1005,63 @@ export async function joinVideoClips(requestBody) {
     throw new Error('The request body must be an object.');
   }
 
-  if (!Array.isArray(requestBody.clips) || requestBody.clips.length === 0) {
-    throw new Error('clips must be a non-empty array.');
-  }
+  const materializedInputs = await materializeJoinClipsInputs(requestBody);
 
-  const clips = requestBody.clips.map((clip, index) => {
-    const normalizedClip = normalizeClipEntry(clip, index);
+  try {
+    const clips = materializedInputs.clips;
+    const outputPath = resolveWorkspacePath(requestBody.output_path ?? requestBody.outputPath, 'output_path');
+    const width = normalizePositiveInteger(requestBody.width, DEFAULT_WIDTH, 'width');
+    const height = normalizePositiveInteger(requestBody.height, DEFAULT_HEIGHT, 'height');
+    const fps = normalizePositiveInteger(requestBody.fps, DEFAULT_FPS, 'fps');
+    const videoCodec = normalizeCodec(requestBody.video_codec ?? requestBody.videoCodec);
+    const crf = normalizeCrf(requestBody.crf);
+    const durations = await Promise.all(clips.map((clip) => probeClipDuration(clip.clip_path)));
+    const { filterGraph, outputLabel, totalDurationSeconds } = buildJoinClipsFilterGraph({
+      clips,
+      durations,
+      width,
+      height,
+      fps,
+    });
+    const encodePreset = getAdaptiveEncodePreset(requestBody.encode_preset ?? requestBody.encodePreset, totalDurationSeconds);
+
+    await mkdir(path.dirname(outputPath), { recursive: true });
+
+    await runCommand('ffmpeg', [
+      '-y',
+      ...clips.flatMap((clip) => ['-i', clip.clip_path]),
+      '-filter_complex',
+      filterGraph,
+      '-map',
+      `[${outputLabel}]`,
+      '-an',
+      '-c:v',
+      videoCodec,
+      '-preset',
+      encodePreset,
+      '-crf',
+      String(crf),
+      '-pix_fmt',
+      'yuv420p',
+      '-movflags',
+      '+faststart',
+      outputPath,
+    ]);
+
     return {
-      clip_path: resolveWorkspacePath(normalizedClip.clip_path, `clips[${index}].clip_path`),
-      transition_to_next: normalizedClip.transition_to_next,
+      output_path: outputPath,
+      total_duration_seconds: totalDurationSeconds,
+      width,
+      height,
+      fps,
+      clips: clips.map((clip) => ({
+        clip_path: clip.clip_path,
+        transition_to_next: clip.transition_to_next,
+      })),
     };
-  });
-
-  const outputPath = resolveWorkspacePath(requestBody.output_path ?? requestBody.outputPath, 'output_path');
-  const width = normalizePositiveInteger(requestBody.width, DEFAULT_WIDTH, 'width');
-  const height = normalizePositiveInteger(requestBody.height, DEFAULT_HEIGHT, 'height');
-  const fps = normalizePositiveInteger(requestBody.fps, DEFAULT_FPS, 'fps');
-  const videoCodec = normalizeCodec(requestBody.video_codec ?? requestBody.videoCodec);
-  const crf = normalizeCrf(requestBody.crf);
-  const durations = await Promise.all(clips.map((clip) => probeClipDuration(clip.clip_path)));
-  const { filterGraph, outputLabel, totalDurationSeconds } = buildJoinClipsFilterGraph({
-    clips,
-    durations,
-    width,
-    height,
-    fps,
-  });
-  const encodePreset = getAdaptiveEncodePreset(requestBody.encode_preset ?? requestBody.encodePreset, totalDurationSeconds);
-
-  await mkdir(path.dirname(outputPath), { recursive: true });
-
-  await runCommand('ffmpeg', [
-    '-y',
-    ...clips.flatMap((clip) => ['-i', clip.clip_path]),
-    '-filter_complex',
-    filterGraph,
-    '-map',
-    `[${outputLabel}]`,
-    '-an',
-    '-c:v',
-    videoCodec,
-    '-preset',
-    encodePreset,
-    '-crf',
-    String(crf),
-    '-pix_fmt',
-    'yuv420p',
-    '-movflags',
-    '+faststart',
-    outputPath,
-  ]);
-
-  return {
-    output_path: outputPath,
-    total_duration_seconds: totalDurationSeconds,
-    width,
-    height,
-    fps,
-    clips: clips.map((clip) => ({
-      clip_path: clip.clip_path,
-      transition_to_next: clip.transition_to_next,
-    })),
-  };
+  } finally {
+    await materializedInputs.cleanup();
+  }
 }
 
 export async function getHealthStatus() {
