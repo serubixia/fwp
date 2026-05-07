@@ -1,5 +1,4 @@
 import { randomUUID } from 'node:crypto';
-import { readFile } from 'node:fs/promises';
 import http from 'node:http';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -39,37 +38,6 @@ function getContentType(request) {
   return String(request.headers['content-type'] || '').toLowerCase();
 }
 
-function normalizeBooleanFlag(value, label) {
-  if (value == null) {
-    return false;
-  }
-
-  if (typeof value === 'boolean') {
-    return value;
-  }
-
-  if (typeof value === 'number') {
-    return value !== 0;
-  }
-
-  if (typeof value === 'string') {
-    const normalizedValue = value.trim().toLowerCase();
-    if (normalizedValue.length === 0) {
-      return false;
-    }
-
-    if (['1', 'true', 'yes', 'on'].includes(normalizedValue)) {
-      return true;
-    }
-
-    if (['0', 'false', 'no', 'off'].includes(normalizedValue)) {
-      return false;
-    }
-  }
-
-  throw new Error(`${label} must be a boolean.`);
-}
-
 function buildGenerateClipJobPaths(jobId) {
   const encodedJobId = encodeURIComponent(jobId);
   const statusPath = `/v1/render/jobs/${encodedJobId}`;
@@ -105,11 +73,14 @@ function buildGenerateClipJobPayload(job) {
 
 function buildJoinClipsJobPayload(job) {
   const { result, ...jobWithoutResult } = job;
+  const sanitizedResult = result == null
+    ? null
+    : Object.fromEntries(Object.entries(result).filter(([key]) => key !== 'buffer'));
 
   return {
     ...jobWithoutResult,
     ...buildJoinClipsJobPaths(job.job_id),
-    result,
+    result: sanitizedResult,
   };
 }
 
@@ -135,14 +106,6 @@ function matchJoinClipsJobPath(pathname) {
     jobId: decodeURIComponent(match[1]),
     action: match[2] === 'download' ? 'download' : 'status',
   };
-}
-
-function wantsAsyncGenerateClip(url, payload) {
-  if (url.searchParams.has('async')) {
-    return normalizeBooleanFlag(url.searchParams.get('async'), 'async');
-  }
-
-  return normalizeBooleanFlag(payload?.async ?? payload?.async_job ?? payload?.asyncJob, 'async');
 }
 
 export function createGenerateClipJobStore({ generateClipHandler = generateClip } = {}) {
@@ -337,8 +300,8 @@ async function readFormBinaryField(formData, fieldName, { required = false } = {
   };
 }
 
-async function readGenerateClipMultipartBody(request, url) {
-  const bodyBuffer = await readBodyBuffer(request, MAX_GENERATE_CLIP_BODY_BYTES);
+async function readMultipartFormData(request, url, maxBodyBytes) {
+  const bodyBuffer = await readBodyBuffer(request, maxBodyBytes);
 
   let formData;
   try {
@@ -353,8 +316,13 @@ async function readGenerateClipMultipartBody(request, url) {
     throw new Error(`Invalid multipart/form-data body: ${error.message}`);
   }
 
+  return formData;
+}
+
+async function readGenerateClipMultipartBody(request, url) {
+  const formData = await readMultipartFormData(request, url, MAX_GENERATE_CLIP_BODY_BYTES);
+
   const payload = {
-    async: readFormTextField(formData, 'async'),
     overlay_text: readFormTextField(formData, 'overlay_text', { required: true }),
     duration_seconds: readFormTextField(formData, 'duration_seconds', { required: true }),
     width: readFormTextField(formData, 'width'),
@@ -391,6 +359,80 @@ async function readGenerateClipBody(request, url) {
   }
 
   throw new Error('generate-clip only accepts multipart/form-data with binary file fields.');
+}
+
+function normalizeJoinClipBinaryFieldName(value, index) {
+  if (typeof value !== 'string' || value.trim().length === 0) {
+    throw new Error(`clips[${index}].clip_binary_field must be a non-empty string.`);
+  }
+
+  return value.trim();
+}
+
+async function readJoinClipsMultipartBody(request, url) {
+  const formData = await readMultipartFormData(request, url, MAX_JOIN_CLIPS_BODY_BYTES);
+  const clipsManifest = readFormJsonField(formData, 'clips', { required: true });
+
+  if (!Array.isArray(clipsManifest) || clipsManifest.length === 0) {
+    throw new Error('clips must contain a non-empty JSON array.');
+  }
+
+  const clips = await Promise.all(clipsManifest.map(async (clip, index) => {
+    if (!clip || typeof clip !== 'object') {
+      throw new Error(`clips[${index}] must be an object.`);
+    }
+
+    const clipPath = clip.clip_path ?? clip.path;
+    const clipBinaryField = clip.clip_binary_field ?? clip.clipBinaryField;
+
+    if (clipPath == null && clipBinaryField == null) {
+      throw new Error(`clips[${index}] must include clip_path or clip_binary_field.`);
+    }
+
+    if (clipPath != null && clipBinaryField != null) {
+      throw new Error(`clips[${index}] must not include both clip_path and clip_binary_field.`);
+    }
+
+    const normalizedClip = {
+      transition_to_next: clip.transition_to_next,
+    };
+
+    if (clipPath != null) {
+      if (typeof clipPath !== 'string' || clipPath.trim().length === 0) {
+        throw new Error(`clips[${index}].clip_path must be a non-empty string.`);
+      }
+
+      normalizedClip.clip_path = clipPath.trim();
+      return normalizedClip;
+    }
+
+    normalizedClip.clip_binary = await readFormBinaryField(
+      formData,
+      normalizeJoinClipBinaryFieldName(clipBinaryField, index),
+      { required: true }
+    );
+    return normalizedClip;
+  }));
+
+  return {
+    clips,
+    width: readFormTextField(formData, 'width'),
+    height: readFormTextField(formData, 'height'),
+    fps: readFormTextField(formData, 'fps'),
+    video_codec: readFormTextField(formData, 'video_codec'),
+    encode_preset: readFormTextField(formData, 'encode_preset'),
+    crf: readFormTextField(formData, 'crf'),
+  };
+}
+
+async function readJoinClipsBody(request, url) {
+  const contentType = getContentType(request);
+
+  if (contentType.includes('multipart/form-data')) {
+    return readJoinClipsMultipartBody(request, url);
+  }
+
+  throw new Error('join-clips only accepts multipart/form-data with binary file fields.');
 }
 
 export function createServer({
@@ -488,14 +530,13 @@ export function createServer({
             return;
           }
 
-          const outputBuffer = await readFile(job.result.output_path);
           sendBinary(
             response,
             200,
-            outputBuffer,
-            'video/mp4',
+            job.result.buffer,
+            job.result.content_type,
             {
-              'content-disposition': `inline; filename="${path.basename(job.result.output_path)}"`,
+              'content-disposition': `inline; filename="${job.result.filename}"`,
             }
           );
           return;
@@ -512,56 +553,33 @@ export function createServer({
       if (request.method === 'POST' && url.pathname === '/v1/render/generate-clip') {
         const payload = await readGenerateClipBody(request, url);
 
-        if (wantsAsyncGenerateClip(url, payload)) {
-          const job = effectiveGenerateClipJobStore.enqueue(payload);
-          const jobPayload = buildGenerateClipJobPayload(job);
+        const job = effectiveGenerateClipJobStore.enqueue(payload);
+        const jobPayload = buildGenerateClipJobPayload(job);
 
-          sendJson(response, 202, {
-            ok: true,
-            async: true,
-            job: 'generate_clip',
-            ...jobPayload,
-          }, {
-            location: jobPayload.status_path,
-          });
-          return;
-        }
-
-        const result = await generateClipHandler(payload);
-        sendBinary(
-          response,
-          200,
-          result.buffer,
-          result.content_type,
-          {
-            'content-disposition': `inline; filename="${result.filename}"`,
-          }
-        );
+        sendJson(response, 202, {
+          ok: true,
+          async: true,
+          job: 'generate_clip',
+          ...jobPayload,
+        }, {
+          location: jobPayload.status_path,
+        });
         return;
       }
 
       if (request.method === 'POST' && url.pathname === '/v1/compose/join-clips') {
-        const payload = await readJsonBody(request, MAX_JOIN_CLIPS_BODY_BYTES);
+        const payload = await readJoinClipsBody(request, url);
 
-        if (wantsAsyncGenerateClip(url, payload)) {
-          const job = effectiveJoinClipsJobStore.enqueue(payload);
-          const jobPayload = buildJoinClipsJobPayload(job);
+        const job = effectiveJoinClipsJobStore.enqueue(payload);
+        const jobPayload = buildJoinClipsJobPayload(job);
 
-          sendJson(response, 202, {
-            ok: true,
-            async: true,
-            job: 'join_video_clips',
-            ...jobPayload,
-          }, {
-            location: jobPayload.status_path,
-          });
-          return;
-        }
-
-        sendJson(response, 200, {
+        sendJson(response, 202, {
           ok: true,
+          async: true,
           job: 'join_video_clips',
-          result: await joinVideoClipsHandler(payload),
+          ...jobPayload,
+        }, {
+          location: jobPayload.status_path,
         });
         return;
       }
