@@ -53,6 +53,8 @@ const DEFAULT_FPS = 30;
 const DEFAULT_CRF = 18;
 const DEFAULT_VIDEO_CODEC = 'libx264';
 const DEFAULT_ENCODE_PRESET = 'medium';
+const LONG_RENDER_ENCODE_PRESET = 'veryfast';
+const LONG_RENDER_THRESHOLD_SECONDS = 20;
 const DEFAULT_AUDIO_CODEC = 'aac';
 const DEFAULT_AUDIO_BITRATE = '192k';
 const DEFAULT_AUDIO_SAMPLE_RATE = 48000;
@@ -60,6 +62,7 @@ const DEFAULT_FONT_SIZE = 72;
 const DEFAULT_FONT_COLOR = 'white';
 const DEFAULT_BORDER_COLOR = 'black@0.45';
 const MAX_REMOTE_UPLOAD_BYTES = 64 * 1024 * 1024;
+const DEFAULT_REMOTE_FETCH_TIMEOUT_MS = 15000;
 const GENERATE_CLIP_UPLOAD_DIR_PREFIX = 'ffmpeg-api-generate-clip-';
 const MIME_TYPE_EXTENSIONS = Object.freeze({
   'image/png': '.png',
@@ -489,6 +492,20 @@ function normalizeEncodePreset(value) {
   return normalizeOptionalString(value, DEFAULT_ENCODE_PRESET);
 }
 
+function normalizeRemoteFetchTimeoutMs() {
+  return normalizePositiveInteger(process.env.REMOTE_FETCH_TIMEOUT_MS, DEFAULT_REMOTE_FETCH_TIMEOUT_MS, 'REMOTE_FETCH_TIMEOUT_MS');
+}
+
+export function getAdaptiveEncodePreset(requestedPreset, durationSeconds) {
+  if (requestedPreset != null) {
+    return normalizeEncodePreset(requestedPreset);
+  }
+
+  return durationSeconds >= LONG_RENDER_THRESHOLD_SECONDS
+    ? LONG_RENDER_ENCODE_PRESET
+    : DEFAULT_ENCODE_PRESET;
+}
+
 function normalizeCrf(value) {
   const numericValue = value == null ? DEFAULT_CRF : Number(value);
   if (!Number.isInteger(numericValue) || numericValue < 0 || numericValue > 51) {
@@ -583,10 +600,17 @@ function getUploadUrl(upload) {
 
 async function fetchUploadBuffer(uploadUrl, label) {
   let response;
+  const fetchTimeoutMs = normalizeRemoteFetchTimeoutMs();
 
   try {
-    response = await fetch(uploadUrl);
+    response = await fetch(uploadUrl, {
+      signal: AbortSignal.timeout(fetchTimeoutMs),
+    });
   } catch (error) {
+    if (error?.name === 'TimeoutError') {
+      throw new Error(`${label}.directory fetch timed out after ${fetchTimeoutMs}ms.`);
+    }
+
     throw new Error(`${label}.directory could not be fetched: ${error.message}`);
   }
 
@@ -833,7 +857,7 @@ export async function generateClip(requestBody) {
     const fontFile = normalizeOptionalString(requestBody.font_file ?? requestBody.fontFile, process.env.FONT_FILE || '/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf');
     const sceneAnimation = validateSceneAnimation(requestBody.scene_animation ?? requestBody.sceneAnimation);
     const videoCodec = normalizeCodec(requestBody.video_codec ?? requestBody.videoCodec);
-    const encodePreset = normalizeEncodePreset(requestBody.encode_preset ?? requestBody.encodePreset);
+    const encodePreset = getAdaptiveEncodePreset(requestBody.encode_preset ?? requestBody.encodePreset, durationSeconds);
     const crf = normalizeCrf(requestBody.crf);
     const audio = normalizeGenerateClipAudio(requestBody, durationSeconds, materializedInputs);
     const filterGraph = buildImageTextSceneFilterGraph({
@@ -903,7 +927,6 @@ export async function joinVideoClips(requestBody) {
   const height = normalizePositiveInteger(requestBody.height, DEFAULT_HEIGHT, 'height');
   const fps = normalizePositiveInteger(requestBody.fps, DEFAULT_FPS, 'fps');
   const videoCodec = normalizeCodec(requestBody.video_codec ?? requestBody.videoCodec);
-  const encodePreset = normalizeEncodePreset(requestBody.encode_preset ?? requestBody.encodePreset);
   const crf = normalizeCrf(requestBody.crf);
   const durations = await Promise.all(clips.map((clip) => probeClipDuration(clip.clip_path)));
   const { filterGraph, outputLabel, totalDurationSeconds } = buildJoinClipsFilterGraph({
@@ -913,6 +936,7 @@ export async function joinVideoClips(requestBody) {
     height,
     fps,
   });
+  const encodePreset = getAdaptiveEncodePreset(requestBody.encode_preset ?? requestBody.encodePreset, totalDurationSeconds);
 
   await mkdir(path.dirname(outputPath), { recursive: true });
 
