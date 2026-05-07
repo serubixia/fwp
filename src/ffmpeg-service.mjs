@@ -63,6 +63,8 @@ const DEFAULT_FONT_COLOR = 'white';
 const DEFAULT_BORDER_COLOR = 'black@0.45';
 const GENERATE_CLIP_UPLOAD_DIR_PREFIX = 'ffmpeg-api-generate-clip-';
 const JOIN_CLIPS_UPLOAD_DIR_PREFIX = 'ffmpeg-api-join-clips-';
+const PROBE_AUDIO_UPLOAD_DIR_PREFIX = 'ffmpeg-api-probe-audio-';
+const WAV_MIME_TYPES = Object.freeze(['audio/wav', 'audio/x-wav']);
 const MIME_TYPE_EXTENSIONS = Object.freeze({
   'image/png': '.png',
   'image/jpeg': '.jpg',
@@ -270,6 +272,7 @@ function buildImageMotionExpressions(sceneAnimation, totalFrames) {
   const lastFrameIndex = Math.max(totalFrames - 1, 1);
   const progress = `on/${lastFrameIndex}`;
   const easedProgress = `(${progress})*(${progress})*(3-2*(${progress}))`;
+  const motionProgress = `0.18*(${progress})+0.82*(${easedProgress})`;
 
   switch (sceneAnimation.image_motion_preset) {
     case 'static_hold':
@@ -281,7 +284,7 @@ function buildImageMotionExpressions(sceneAnimation, totalFrames) {
     case 'slow_push_in': {
       const finalZoom = sceneAnimation.speed === 'slow' ? 1.1 : 1.16;
       return {
-        z: `1+${formatNumber(finalZoom - 1)}*${easedProgress}`,
+        z: `1+${formatNumber(finalZoom - 1)}*${motionProgress}`,
         x: 'iw/2-(iw/zoom/2)',
         y: 'ih/2-(ih/zoom/2)',
       };
@@ -289,7 +292,7 @@ function buildImageMotionExpressions(sceneAnimation, totalFrames) {
     case 'slow_pull_out': {
       const initialZoom = sceneAnimation.speed === 'slow' ? 1.12 : 1.18;
       return {
-        z: `${formatNumber(initialZoom)}-${formatNumber(initialZoom - 1)}*${easedProgress}`,
+        z: `${formatNumber(initialZoom)}-${formatNumber(initialZoom - 1)}*${motionProgress}`,
         x: 'iw/2-(iw/zoom/2)',
         y: 'ih/2-(ih/zoom/2)',
       };
@@ -297,26 +300,26 @@ function buildImageMotionExpressions(sceneAnimation, totalFrames) {
     case 'pan_left_slow':
       return {
         z: sceneAnimation.speed === 'slow' ? '1.08' : '1.12',
-        x: `(iw-iw/zoom)*${easedProgress}`,
+        x: `(iw-iw/zoom)*${motionProgress}`,
         y: 'ih/2-(ih/zoom/2)',
       };
     case 'pan_right_slow':
       return {
         z: sceneAnimation.speed === 'slow' ? '1.08' : '1.12',
-        x: `(iw-iw/zoom)*(1-${easedProgress})`,
+        x: `(iw-iw/zoom)*(1-${motionProgress})`,
         y: 'ih/2-(ih/zoom/2)',
       };
     case 'drift_up_soft':
       return {
         z: sceneAnimation.speed === 'slow' ? '1.06' : '1.1',
         x: 'iw/2-(iw/zoom/2)',
-        y: `(ih-ih/zoom)*(1-${easedProgress})`,
+        y: `(ih-ih/zoom)*(1-${motionProgress})`,
       };
     case 'drift_down_soft':
       return {
         z: sceneAnimation.speed === 'slow' ? '1.06' : '1.1',
         x: 'iw/2-(iw/zoom/2)',
-        y: `(ih-ih/zoom)*${easedProgress}`,
+        y: `(ih-ih/zoom)*${motionProgress}`,
       };
     case 'parallax_float':
       return {
@@ -701,6 +704,17 @@ function getUploadExtension(upload, fallbackExtension) {
   return MIME_TYPE_EXTENSIONS[upload.mime_type] || fallbackExtension;
 }
 
+function assertWavUpload(upload, label) {
+  const filename = getUploadFilename(upload, label).toLowerCase();
+  const mimeType = getUploadMimeType(upload, label).toLowerCase();
+
+  if (WAV_MIME_TYPES.includes(mimeType) || path.extname(filename) === '.wav') {
+    return;
+  }
+
+  throw new Error(`${label} must be an audio/wav upload.`);
+}
+
 async function writeBinaryUploadToTempFile(upload, tempDir, baseName, fallbackExtension) {
   const normalizedUpload = await normalizeBinaryUpload(upload, baseName);
   const filePath = path.join(tempDir, `${baseName}${getUploadExtension(normalizedUpload, fallbackExtension)}`);
@@ -753,6 +767,37 @@ export async function materializeGenerateClipBinaryInputs(requestBody, tempRoot 
   }
 }
 
+export async function materializeProbeAudioBinaryInput(requestBody, tempRoot = tmpdir()) {
+  const audioBinary = requestBody.audio_binary ?? requestBody.audioBinary;
+
+  if (audioBinary == null) {
+    return null;
+  }
+
+  const tempDir = await mkdtemp(path.join(tempRoot, PROBE_AUDIO_UPLOAD_DIR_PREFIX));
+
+  try {
+    if (audioBinary.buffer == null) {
+      throw new Error('audio_binary must be sent as an n8n binary file upload.');
+    }
+
+    assertWavUpload(audioBinary, 'audio_binary');
+
+    return {
+      temp_dir: tempDir,
+      audio_path: await writeBinaryUploadToTempFile(audioBinary, tempDir, 'audio-upload', '.wav'),
+      filename: getUploadFilename(audioBinary, 'audio_binary') || 'audio.wav',
+      mime_type: getUploadMimeType(audioBinary, 'audio_binary') || 'audio/wav',
+      cleanup: async () => {
+        await rm(tempDir, { recursive: true, force: true });
+      },
+    };
+  } catch (error) {
+    await rm(tempDir, { recursive: true, force: true });
+    throw error;
+  }
+}
+
 export async function materializeJoinClipsInputs(requestBody, tempRoot = tmpdir()) {
   if (!requestBody || typeof requestBody !== 'object') {
     throw new Error('The request body must be an object.');
@@ -794,6 +839,30 @@ export async function materializeJoinClipsInputs(requestBody, tempRoot = tmpdir(
       await rm(tempDir, { recursive: true, force: true });
     }
     throw error;
+  }
+}
+
+export async function probeAudioDuration(requestBody) {
+  if (!requestBody || typeof requestBody !== 'object') {
+    throw new Error('The request body must be an object.');
+  }
+
+  const materializedInput = await materializeProbeAudioBinaryInput(requestBody);
+
+  try {
+    if (materializedInput?.audio_path == null) {
+      throw new Error('audio_binary is required.');
+    }
+
+    const durationSeconds = await probeClipDuration(materializedInput.audio_path);
+
+    return {
+      duration_seconds: Number(formatNumber(durationSeconds, 3)),
+      filename: materializedInput.filename,
+      mime_type: materializedInput.mime_type,
+    };
+  } finally {
+    await materializedInput?.cleanup?.();
   }
 }
 
