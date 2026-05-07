@@ -1,5 +1,5 @@
 {
-  "name": "docker-ffmpeg",
+  "name": "ffmpeg-api",
   "private": true,
   "type": "module",
   "engines": {
