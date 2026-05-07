@@ -553,11 +553,12 @@ function buildImageMotionExpressions(sceneAnimation, {
         verticalAmplitudeConfig.minAmplitudeRatio,
         verticalAmplitudeConfig.maxAmplitudeRatio
       );
+      const verticalFloatEnvelope = `(4*${easedProgress}*(1-${easedProgress}))`;
 
       return {
         z: formatNumber(zoomLevel, 3),
         x: `(iw-iw/zoom)*(${horizontalBudget.startRatio}+${horizontalBudget.travelRatio}*${easedProgress})`,
-        y: `(ih-ih/zoom)*(0.5+${formatNumber(verticalAmplitudeRatio, 3)}*sin(${formatNumber(Math.PI, 6)}*${progress}))`,
+        y: `(ih-ih/zoom)*(0.5+${formatNumber(verticalAmplitudeRatio, 3)}*${verticalFloatEnvelope})`,
       };
     }
     default:
