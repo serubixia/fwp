@@ -305,6 +305,10 @@ function buildSmootherStepExpression(progressExpression) {
   return `(${progressExpression})*(${progressExpression})*(${progressExpression})*((${progressExpression})*((${progressExpression})*6-15)+10)`;
 }
 
+function buildBellEnvelopeExpression(progressExpression) {
+  return `(4*${progressExpression}*(1-${progressExpression}))`;
+}
+
 function buildProgressExpressions(totalFrames) {
   const lastFrameIndex = Math.max(totalFrames - 1, 1);
   const progress = `on/${lastFrameIndex}`;
@@ -315,249 +319,218 @@ function buildProgressExpressions(totalFrames) {
   };
 }
 
-function getDurationAwareZoomDelta(durationSeconds, {
-  minDelta,
-  maxDelta,
-  deltaPerSecond,
+function getDurationAwareMotionValue(durationSeconds, {
+  minValue,
+  maxValue,
+  valuePerSecond,
 }) {
-  return clampNumber(durationSeconds * deltaPerSecond, minDelta, maxDelta);
+  return clampNumber(durationSeconds * valuePerSecond, minValue, maxValue);
 }
 
-const TRAVEL_MOTION_FAMILY_CONFIG = Object.freeze({
-  pan: Object.freeze({
-    zoomDelta: Object.freeze({
-      slow: Object.freeze({ minDelta: 0.028, maxDelta: 0.048, deltaPerSecond: 0.0008 }),
-      medium: Object.freeze({ minDelta: 0.04, maxDelta: 0.072, deltaPerSecond: 0.0011 }),
+const IMAGE_MOTION_PRESET_CONFIG = Object.freeze({
+  static_hold: Object.freeze({
+    slow: Object.freeze({ zoomLevel: 1.012 }),
+    medium: Object.freeze({ zoomLevel: 1.018 }),
+  }),
+  slow_push_in: Object.freeze({
+    slow: Object.freeze({
+      startZoom: 1.01,
+      zoomDelta: Object.freeze({ minValue: 0.018, maxValue: 0.045, valuePerSecond: 0.00075 }),
     }),
-    travel: Object.freeze({
-      slow: Object.freeze({ pixelsPerSecond: 0.4, minTravelPixels: 6, maxTravelRatio: 0.32 }),
-      medium: Object.freeze({ pixelsPerSecond: 0.65, minTravelPixels: 10, maxTravelRatio: 0.42 }),
+    medium: Object.freeze({
+      startZoom: 1.014,
+      zoomDelta: Object.freeze({ minValue: 0.028, maxValue: 0.065, valuePerSecond: 0.00105 }),
     }),
   }),
-  drift: Object.freeze({
-    zoomDelta: Object.freeze({
-      slow: Object.freeze({ minDelta: 0.024, maxDelta: 0.042, deltaPerSecond: 0.0007 }),
-      medium: Object.freeze({ minDelta: 0.036, maxDelta: 0.06, deltaPerSecond: 0.00095 }),
+  slow_pull_out: Object.freeze({
+    slow: Object.freeze({
+      endZoom: 1.012,
+      zoomDelta: Object.freeze({ minValue: 0.022, maxValue: 0.048, valuePerSecond: 0.0008 }),
     }),
-    travel: Object.freeze({
-      slow: Object.freeze({ pixelsPerSecond: 0.22, minTravelPixels: 4, maxTravelRatio: 0.2 }),
-      medium: Object.freeze({ pixelsPerSecond: 0.34, minTravelPixels: 6, maxTravelRatio: 0.28 }),
+    medium: Object.freeze({
+      endZoom: 1.016,
+      zoomDelta: Object.freeze({ minValue: 0.032, maxValue: 0.07, valuePerSecond: 0.0011 }),
     }),
   }),
-  parallax: Object.freeze({
-    zoomDelta: Object.freeze({
-      slow: Object.freeze({ minDelta: 0.04, maxDelta: 0.065, deltaPerSecond: 0.0009 }),
-      medium: Object.freeze({ minDelta: 0.055, maxDelta: 0.085, deltaPerSecond: 0.00115 }),
+  pan_left_slow: Object.freeze({
+    slow: Object.freeze({
+      zoomDelta: Object.freeze({ minValue: 0.05, maxValue: 0.075, valuePerSecond: 0.001 }),
+      travelRatio: Object.freeze({ minValue: 0.08, maxValue: 0.16, valuePerSecond: 0.0022 }),
     }),
-    horizontalTravel: Object.freeze({
-      slow: Object.freeze({ pixelsPerSecond: 0.28, minTravelPixels: 8, maxTravelRatio: 0.22 }),
-      medium: Object.freeze({ pixelsPerSecond: 0.42, minTravelPixels: 10, maxTravelRatio: 0.28 }),
+    medium: Object.freeze({
+      zoomDelta: Object.freeze({ minValue: 0.068, maxValue: 0.098, valuePerSecond: 0.0013 }),
+      travelRatio: Object.freeze({ minValue: 0.11, maxValue: 0.22, valuePerSecond: 0.0029 }),
     }),
-    verticalAmplitude: Object.freeze({
-      slow: Object.freeze({ pixelsPerSecond: 0.14, minAmplitudeRatio: 0.03, maxAmplitudeRatio: 0.07 }),
-      medium: Object.freeze({ pixelsPerSecond: 0.2, minAmplitudeRatio: 0.04, maxAmplitudeRatio: 0.1 }),
+  }),
+  pan_right_slow: Object.freeze({
+    slow: Object.freeze({
+      zoomDelta: Object.freeze({ minValue: 0.05, maxValue: 0.075, valuePerSecond: 0.001 }),
+      travelRatio: Object.freeze({ minValue: 0.08, maxValue: 0.16, valuePerSecond: 0.0022 }),
+    }),
+    medium: Object.freeze({
+      zoomDelta: Object.freeze({ minValue: 0.068, maxValue: 0.098, valuePerSecond: 0.0013 }),
+      travelRatio: Object.freeze({ minValue: 0.11, maxValue: 0.22, valuePerSecond: 0.0029 }),
+    }),
+  }),
+  drift_up_soft: Object.freeze({
+    slow: Object.freeze({
+      zoomDelta: Object.freeze({ minValue: 0.046, maxValue: 0.068, valuePerSecond: 0.0009 }),
+      travelRatio: Object.freeze({ minValue: 0.06, maxValue: 0.13, valuePerSecond: 0.0018 }),
+    }),
+    medium: Object.freeze({
+      zoomDelta: Object.freeze({ minValue: 0.06, maxValue: 0.085, valuePerSecond: 0.00115 }),
+      travelRatio: Object.freeze({ minValue: 0.085, maxValue: 0.17, valuePerSecond: 0.0023 }),
+    }),
+  }),
+  drift_down_soft: Object.freeze({
+    slow: Object.freeze({
+      zoomDelta: Object.freeze({ minValue: 0.046, maxValue: 0.068, valuePerSecond: 0.0009 }),
+      travelRatio: Object.freeze({ minValue: 0.06, maxValue: 0.13, valuePerSecond: 0.0018 }),
+    }),
+    medium: Object.freeze({
+      zoomDelta: Object.freeze({ minValue: 0.06, maxValue: 0.085, valuePerSecond: 0.00115 }),
+      travelRatio: Object.freeze({ minValue: 0.085, maxValue: 0.17, valuePerSecond: 0.0023 }),
+    }),
+  }),
+  parallax_float: Object.freeze({
+    slow: Object.freeze({
+      zoomDelta: Object.freeze({ minValue: 0.062, maxValue: 0.088, valuePerSecond: 0.0011 }),
+      horizontalTravelRatio: Object.freeze({ minValue: 0.06, maxValue: 0.12, valuePerSecond: 0.0015 }),
+      verticalAmplitudeRatio: Object.freeze({ minValue: 0.018, maxValue: 0.034, valuePerSecond: 0.00055 }),
+    }),
+    medium: Object.freeze({
+      zoomDelta: Object.freeze({ minValue: 0.078, maxValue: 0.105, valuePerSecond: 0.00135 }),
+      horizontalTravelRatio: Object.freeze({ minValue: 0.085, maxValue: 0.16, valuePerSecond: 0.00195 }),
+      verticalAmplitudeRatio: Object.freeze({ minValue: 0.026, maxValue: 0.046, valuePerSecond: 0.00075 }),
     }),
   }),
 });
 
-function getDurationAwareTravelFamilyZoomLevel(durationSeconds, familyName, speed) {
-  const familyConfig = TRAVEL_MOTION_FAMILY_CONFIG[familyName];
-  const zoomConfig = familyConfig?.zoomDelta?.[speed];
+function getImageMotionPresetProfile(imageMotionPreset, speed) {
+  const presetConfig = IMAGE_MOTION_PRESET_CONFIG[imageMotionPreset];
+  const speedConfig = presetConfig?.[speed];
 
-  if (!zoomConfig) {
-    throw new Error(`Unsupported travel motion family: ${familyName}.${speed}`);
+  if (!speedConfig) {
+    throw new Error(`Unsupported image motion preset profile: ${imageMotionPreset}.${speed}`);
   }
 
-  return 1 + getDurationAwareZoomDelta(durationSeconds, zoomConfig);
+  return speedConfig;
 }
 
-function buildDurationAwareTravelFamilyBudget({
-  durationSeconds,
-  sourceSize,
-  zoomLevel,
-  familyName,
-  speed,
-}) {
-  const familyConfig = TRAVEL_MOTION_FAMILY_CONFIG[familyName];
-  const travelConfig = familyConfig?.travel?.[speed] ?? familyConfig?.horizontalTravel?.[speed];
-
-  if (!travelConfig) {
-    throw new Error(`Unsupported travel budget family: ${familyName}.${speed}`);
-  }
-
-  return buildDurationAwareTravelBudget({
-    durationSeconds,
-    sourceSize,
-    zoomLevel,
-    pixelsPerSecond: travelConfig.pixelsPerSecond,
-    minTravelPixels: travelConfig.minTravelPixels,
-    maxTravelRatio: travelConfig.maxTravelRatio,
-  });
-}
-
-function buildDurationAwareTravelBudget({
-  durationSeconds,
-  sourceSize,
-  zoomLevel,
-  pixelsPerSecond,
-  minTravelPixels,
-  maxTravelRatio,
-}) {
-  const availableTravelPixels = Math.max(sourceSize - (sourceSize / zoomLevel), 1);
-  const desiredTravelPixels = clampNumber(
-    durationSeconds * pixelsPerSecond,
-    minTravelPixels,
-    availableTravelPixels * maxTravelRatio
-  );
-  const travelRatio = desiredTravelPixels / availableTravelPixels;
-  const startRatio = 0.5 - (travelRatio / 2);
+function buildNormalizedTravelWindow(travelRatio) {
+  const clampedTravelRatio = clampNumber(travelRatio, 0, 0.45);
+  const startRatio = 0.5 - (clampedTravelRatio / 2);
 
   return {
     startRatio: formatNumber(startRatio, 3),
-    endRatio: formatNumber(startRatio + travelRatio, 3),
-    travelRatio: formatNumber(travelRatio, 3),
+    endRatio: formatNumber(startRatio + clampedTravelRatio, 3),
+    travelRatio: formatNumber(clampedTravelRatio, 3),
   };
 }
 
 function buildImageMotionExpressions(sceneAnimation, {
   durationSeconds,
   totalFrames,
-  sourceWidth,
-  sourceHeight,
 }) {
-  const { progress, easedProgress } = buildProgressExpressions(totalFrames);
+  const { easedProgress } = buildProgressExpressions(totalFrames);
+  const horizontalCenter = 'iw/2-(iw/zoom/2)';
+  const verticalCenter = 'ih/2-(ih/zoom/2)';
 
   switch (sceneAnimation.image_motion_preset) {
-    case 'static_hold':
-      return {
-        z: '1.015',
-        x: 'iw/2-(iw/zoom/2)',
-        y: 'ih/2-(ih/zoom/2)',
-      };
-    case 'slow_push_in': {
-      const zoomDelta = sceneAnimation.speed === 'slow'
-        ? getDurationAwareZoomDelta(durationSeconds, {
-          minDelta: 0.018,
-          maxDelta: 0.06,
-          deltaPerSecond: 0.0011,
-        })
-        : getDurationAwareZoomDelta(durationSeconds, {
-          minDelta: 0.028,
-          maxDelta: 0.09,
-          deltaPerSecond: 0.00145,
-        });
+    case 'static_hold': {
+      const profile = getImageMotionPresetProfile(sceneAnimation.image_motion_preset, sceneAnimation.speed);
 
       return {
-        z: `1+${formatNumber(zoomDelta, 3)}*${easedProgress}`,
-        x: 'iw/2-(iw/zoom/2)',
-        y: 'ih/2-(ih/zoom/2)',
+        z: formatNumber(profile.zoomLevel, 3),
+        x: horizontalCenter,
+        y: verticalCenter,
+      };
+    }
+    case 'slow_push_in': {
+      const profile = getImageMotionPresetProfile(sceneAnimation.image_motion_preset, sceneAnimation.speed);
+      const zoomDelta = getDurationAwareMotionValue(durationSeconds, profile.zoomDelta);
+
+      return {
+        z: `${formatNumber(profile.startZoom, 3)}+${formatNumber(zoomDelta, 3)}*${easedProgress}`,
+        x: horizontalCenter,
+        y: verticalCenter,
       };
     }
     case 'slow_pull_out': {
-      const zoomDelta = sceneAnimation.speed === 'slow'
-        ? getDurationAwareZoomDelta(durationSeconds, {
-          minDelta: 0.02,
-          maxDelta: 0.065,
-          deltaPerSecond: 0.0012,
-        })
-        : getDurationAwareZoomDelta(durationSeconds, {
-          minDelta: 0.032,
-          maxDelta: 0.095,
-          deltaPerSecond: 0.00155,
-        });
-      const initialZoom = 1 + zoomDelta;
+      const profile = getImageMotionPresetProfile(sceneAnimation.image_motion_preset, sceneAnimation.speed);
+      const zoomDelta = getDurationAwareMotionValue(durationSeconds, profile.zoomDelta);
+      const initialZoom = profile.endZoom + zoomDelta;
 
       return {
         z: `${formatNumber(initialZoom, 3)}-${formatNumber(zoomDelta, 3)}*${easedProgress}`,
-        x: 'iw/2-(iw/zoom/2)',
-        y: 'ih/2-(ih/zoom/2)',
+        x: horizontalCenter,
+        y: verticalCenter,
       };
     }
     case 'pan_left_slow': {
-      const zoomLevel = getDurationAwareTravelFamilyZoomLevel(durationSeconds, 'pan', sceneAnimation.speed);
-      const travelBudget = buildDurationAwareTravelFamilyBudget({
-        durationSeconds,
-        sourceSize: sourceWidth,
-        zoomLevel,
-        familyName: 'pan',
-        speed: sceneAnimation.speed,
-      });
+      const profile = getImageMotionPresetProfile(sceneAnimation.image_motion_preset, sceneAnimation.speed);
+      const zoomLevel = 1 + getDurationAwareMotionValue(durationSeconds, profile.zoomDelta);
+      const travelWindow = buildNormalizedTravelWindow(
+        getDurationAwareMotionValue(durationSeconds, profile.travelRatio)
+      );
 
       return {
         z: formatNumber(zoomLevel, 3),
-        x: `(iw-iw/zoom)*(${travelBudget.startRatio}+${travelBudget.travelRatio}*${easedProgress})`,
-        y: 'ih/2-(ih/zoom/2)',
+        x: `(iw-iw/zoom)*(${travelWindow.startRatio}+${travelWindow.travelRatio}*${easedProgress})`,
+        y: verticalCenter,
       };
     }
     case 'pan_right_slow': {
-      const zoomLevel = getDurationAwareTravelFamilyZoomLevel(durationSeconds, 'pan', sceneAnimation.speed);
-      const travelBudget = buildDurationAwareTravelFamilyBudget({
-        durationSeconds,
-        sourceSize: sourceWidth,
-        zoomLevel,
-        familyName: 'pan',
-        speed: sceneAnimation.speed,
-      });
+      const profile = getImageMotionPresetProfile(sceneAnimation.image_motion_preset, sceneAnimation.speed);
+      const zoomLevel = 1 + getDurationAwareMotionValue(durationSeconds, profile.zoomDelta);
+      const travelWindow = buildNormalizedTravelWindow(
+        getDurationAwareMotionValue(durationSeconds, profile.travelRatio)
+      );
 
       return {
         z: formatNumber(zoomLevel, 3),
-        x: `(iw-iw/zoom)*(${travelBudget.endRatio}-${travelBudget.travelRatio}*${easedProgress})`,
-        y: 'ih/2-(ih/zoom/2)',
+        x: `(iw-iw/zoom)*(${travelWindow.endRatio}-${travelWindow.travelRatio}*${easedProgress})`,
+        y: verticalCenter,
       };
     }
     case 'drift_up_soft': {
-      const zoomLevel = getDurationAwareTravelFamilyZoomLevel(durationSeconds, 'drift', sceneAnimation.speed);
-      const travelBudget = buildDurationAwareTravelFamilyBudget({
-        durationSeconds,
-        sourceSize: sourceHeight,
-        zoomLevel,
-        familyName: 'drift',
-        speed: sceneAnimation.speed,
-      });
+      const profile = getImageMotionPresetProfile(sceneAnimation.image_motion_preset, sceneAnimation.speed);
+      const zoomLevel = 1 + getDurationAwareMotionValue(durationSeconds, profile.zoomDelta);
+      const travelWindow = buildNormalizedTravelWindow(
+        getDurationAwareMotionValue(durationSeconds, profile.travelRatio)
+      );
 
       return {
         z: formatNumber(zoomLevel, 3),
-        x: 'iw/2-(iw/zoom/2)',
-        y: `(ih-ih/zoom)*(${travelBudget.endRatio}-${travelBudget.travelRatio}*${easedProgress})`,
+        x: horizontalCenter,
+        y: `(ih-ih/zoom)*(${travelWindow.endRatio}-${travelWindow.travelRatio}*${easedProgress})`,
       };
     }
     case 'drift_down_soft': {
-      const zoomLevel = getDurationAwareTravelFamilyZoomLevel(durationSeconds, 'drift', sceneAnimation.speed);
-      const travelBudget = buildDurationAwareTravelFamilyBudget({
-        durationSeconds,
-        sourceSize: sourceHeight,
-        zoomLevel,
-        familyName: 'drift',
-        speed: sceneAnimation.speed,
-      });
+      const profile = getImageMotionPresetProfile(sceneAnimation.image_motion_preset, sceneAnimation.speed);
+      const zoomLevel = 1 + getDurationAwareMotionValue(durationSeconds, profile.zoomDelta);
+      const travelWindow = buildNormalizedTravelWindow(
+        getDurationAwareMotionValue(durationSeconds, profile.travelRatio)
+      );
 
       return {
         z: formatNumber(zoomLevel, 3),
-        x: 'iw/2-(iw/zoom/2)',
-        y: `(ih-ih/zoom)*(${travelBudget.startRatio}+${travelBudget.travelRatio}*${easedProgress})`,
+        x: horizontalCenter,
+        y: `(ih-ih/zoom)*(${travelWindow.startRatio}+${travelWindow.travelRatio}*${easedProgress})`,
       };
     }
     case 'parallax_float': {
-      const zoomLevel = getDurationAwareTravelFamilyZoomLevel(durationSeconds, 'parallax', sceneAnimation.speed);
-      const horizontalBudget = buildDurationAwareTravelFamilyBudget({
-        durationSeconds,
-        sourceSize: sourceWidth,
-        zoomLevel,
-        familyName: 'parallax',
-        speed: sceneAnimation.speed,
-      });
-      const verticalAmplitudeConfig = TRAVEL_MOTION_FAMILY_CONFIG.parallax.verticalAmplitude[sceneAnimation.speed];
-      const verticalSlack = Math.max(sourceHeight - (sourceHeight / zoomLevel), 1);
-      const verticalAmplitudeRatio = clampNumber(
-        (durationSeconds * verticalAmplitudeConfig.pixelsPerSecond) / verticalSlack,
-        verticalAmplitudeConfig.minAmplitudeRatio,
-        verticalAmplitudeConfig.maxAmplitudeRatio
+      const profile = getImageMotionPresetProfile(sceneAnimation.image_motion_preset, sceneAnimation.speed);
+      const zoomLevel = 1 + getDurationAwareMotionValue(durationSeconds, profile.zoomDelta);
+      const horizontalTravelWindow = buildNormalizedTravelWindow(
+        getDurationAwareMotionValue(durationSeconds, profile.horizontalTravelRatio)
       );
-      const verticalFloatEnvelope = `(4*${easedProgress}*(1-${easedProgress}))`;
+      const verticalAmplitudeRatio = getDurationAwareMotionValue(durationSeconds, profile.verticalAmplitudeRatio);
+      const verticalFloatEnvelope = buildBellEnvelopeExpression(easedProgress);
 
       return {
         z: formatNumber(zoomLevel, 3),
-        x: `(iw-iw/zoom)*(${horizontalBudget.startRatio}+${horizontalBudget.travelRatio}*${easedProgress})`,
+        x: `(iw-iw/zoom)*(${horizontalTravelWindow.startRatio}+${horizontalTravelWindow.travelRatio}*${easedProgress})`,
         y: `(ih-ih/zoom)*(0.5+${formatNumber(verticalAmplitudeRatio, 3)}*${verticalFloatEnvelope})`,
       };
     }
