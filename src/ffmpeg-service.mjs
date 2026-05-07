@@ -62,7 +62,6 @@ const DEFAULT_FONT_SIZE = 72;
 const DEFAULT_FONT_COLOR = 'white';
 const DEFAULT_BORDER_COLOR = 'black@0.45';
 const MAX_REMOTE_UPLOAD_BYTES = 64 * 1024 * 1024;
-const DEFAULT_REMOTE_FETCH_TIMEOUT_MS = 15000;
 const GENERATE_CLIP_UPLOAD_DIR_PREFIX = 'ffmpeg-api-generate-clip-';
 const MIME_TYPE_EXTENSIONS = Object.freeze({
   'image/png': '.png',
@@ -492,10 +491,6 @@ function normalizeEncodePreset(value) {
   return normalizeOptionalString(value, DEFAULT_ENCODE_PRESET);
 }
 
-function normalizeRemoteFetchTimeoutMs() {
-  return normalizePositiveInteger(process.env.REMOTE_FETCH_TIMEOUT_MS, DEFAULT_REMOTE_FETCH_TIMEOUT_MS, 'REMOTE_FETCH_TIMEOUT_MS');
-}
-
 export function getAdaptiveEncodePreset(requestedPreset, durationSeconds) {
   if (requestedPreset != null) {
     return normalizeEncodePreset(requestedPreset);
@@ -600,17 +595,10 @@ function getUploadUrl(upload) {
 
 async function fetchUploadBuffer(uploadUrl, label) {
   let response;
-  const fetchTimeoutMs = normalizeRemoteFetchTimeoutMs();
 
   try {
-    response = await fetch(uploadUrl, {
-      signal: AbortSignal.timeout(fetchTimeoutMs),
-    });
+    response = await fetch(uploadUrl);
   } catch (error) {
-    if (error?.name === 'TimeoutError') {
-      throw new Error(`${label}.directory fetch timed out after ${fetchTimeoutMs}ms.`);
-    }
-
     throw new Error(`${label}.directory could not be fetched: ${error.message}`);
   }
 
