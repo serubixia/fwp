@@ -297,96 +297,310 @@ function getTextAnchorYExpression(textAnchor) {
   }
 }
 
-function buildImageMotionExpressions(sceneAnimation, totalFrames) {
+function clampNumber(value, minValue, maxValue) {
+  return Math.min(Math.max(value, minValue), maxValue);
+}
+
+function buildSmootherStepExpression(progressExpression) {
+  return `(${progressExpression})*(${progressExpression})*(${progressExpression})*((${progressExpression})*((${progressExpression})*6-15)+10)`;
+}
+
+function buildProgressExpressions(totalFrames) {
   const lastFrameIndex = Math.max(totalFrames - 1, 1);
   const progress = `on/${lastFrameIndex}`;
-  const easedProgress = `(${progress})*(${progress})*(3-2*(${progress}))`;
-  const centeredTravelRange = sceneAnimation.speed === 'slow' ? 0.22 : 0.3;
-  const centeredTravelStart = (1 - centeredTravelRange) / 2;
-  const centeredTravelRangeExpression = formatNumber(centeredTravelRange, 3);
-  const centeredTravelStartExpression = formatNumber(centeredTravelStart, 3);
-  const centeredTravelEndExpression = formatNumber(centeredTravelStart + centeredTravelRange, 3);
-  const centeredTravelProgress = `${centeredTravelStartExpression}+${centeredTravelRangeExpression}*${easedProgress}`;
+
+  return {
+    progress,
+    easedProgress: buildSmootherStepExpression(progress),
+  };
+}
+
+function getDurationAwareZoomDelta(durationSeconds, {
+  minDelta,
+  maxDelta,
+  deltaPerSecond,
+}) {
+  return clampNumber(durationSeconds * deltaPerSecond, minDelta, maxDelta);
+}
+
+const TRAVEL_MOTION_FAMILY_CONFIG = Object.freeze({
+  pan: Object.freeze({
+    zoomDelta: Object.freeze({
+      slow: Object.freeze({ minDelta: 0.028, maxDelta: 0.048, deltaPerSecond: 0.0008 }),
+      medium: Object.freeze({ minDelta: 0.04, maxDelta: 0.072, deltaPerSecond: 0.0011 }),
+    }),
+    travel: Object.freeze({
+      slow: Object.freeze({ pixelsPerSecond: 0.4, minTravelPixels: 6, maxTravelRatio: 0.32 }),
+      medium: Object.freeze({ pixelsPerSecond: 0.65, minTravelPixels: 10, maxTravelRatio: 0.42 }),
+    }),
+  }),
+  drift: Object.freeze({
+    zoomDelta: Object.freeze({
+      slow: Object.freeze({ minDelta: 0.024, maxDelta: 0.042, deltaPerSecond: 0.0007 }),
+      medium: Object.freeze({ minDelta: 0.036, maxDelta: 0.06, deltaPerSecond: 0.00095 }),
+    }),
+    travel: Object.freeze({
+      slow: Object.freeze({ pixelsPerSecond: 0.22, minTravelPixels: 4, maxTravelRatio: 0.2 }),
+      medium: Object.freeze({ pixelsPerSecond: 0.34, minTravelPixels: 6, maxTravelRatio: 0.28 }),
+    }),
+  }),
+  parallax: Object.freeze({
+    zoomDelta: Object.freeze({
+      slow: Object.freeze({ minDelta: 0.04, maxDelta: 0.065, deltaPerSecond: 0.0009 }),
+      medium: Object.freeze({ minDelta: 0.055, maxDelta: 0.085, deltaPerSecond: 0.00115 }),
+    }),
+    horizontalTravel: Object.freeze({
+      slow: Object.freeze({ pixelsPerSecond: 0.28, minTravelPixels: 8, maxTravelRatio: 0.22 }),
+      medium: Object.freeze({ pixelsPerSecond: 0.42, minTravelPixels: 10, maxTravelRatio: 0.28 }),
+    }),
+    verticalAmplitude: Object.freeze({
+      slow: Object.freeze({ pixelsPerSecond: 0.14, minAmplitudeRatio: 0.03, maxAmplitudeRatio: 0.07 }),
+      medium: Object.freeze({ pixelsPerSecond: 0.2, minAmplitudeRatio: 0.04, maxAmplitudeRatio: 0.1 }),
+    }),
+  }),
+});
+
+function getDurationAwareTravelFamilyZoomLevel(durationSeconds, familyName, speed) {
+  const familyConfig = TRAVEL_MOTION_FAMILY_CONFIG[familyName];
+  const zoomConfig = familyConfig?.zoomDelta?.[speed];
+
+  if (!zoomConfig) {
+    throw new Error(`Unsupported travel motion family: ${familyName}.${speed}`);
+  }
+
+  return 1 + getDurationAwareZoomDelta(durationSeconds, zoomConfig);
+}
+
+function buildDurationAwareTravelFamilyBudget({
+  durationSeconds,
+  sourceSize,
+  zoomLevel,
+  familyName,
+  speed,
+}) {
+  const familyConfig = TRAVEL_MOTION_FAMILY_CONFIG[familyName];
+  const travelConfig = familyConfig?.travel?.[speed] ?? familyConfig?.horizontalTravel?.[speed];
+
+  if (!travelConfig) {
+    throw new Error(`Unsupported travel budget family: ${familyName}.${speed}`);
+  }
+
+  return buildDurationAwareTravelBudget({
+    durationSeconds,
+    sourceSize,
+    zoomLevel,
+    pixelsPerSecond: travelConfig.pixelsPerSecond,
+    minTravelPixels: travelConfig.minTravelPixels,
+    maxTravelRatio: travelConfig.maxTravelRatio,
+  });
+}
+
+function buildDurationAwareTravelBudget({
+  durationSeconds,
+  sourceSize,
+  zoomLevel,
+  pixelsPerSecond,
+  minTravelPixels,
+  maxTravelRatio,
+}) {
+  const availableTravelPixels = Math.max(sourceSize - (sourceSize / zoomLevel), 1);
+  const desiredTravelPixels = clampNumber(
+    durationSeconds * pixelsPerSecond,
+    minTravelPixels,
+    availableTravelPixels * maxTravelRatio
+  );
+  const travelRatio = desiredTravelPixels / availableTravelPixels;
+  const startRatio = 0.5 - (travelRatio / 2);
+
+  return {
+    startRatio: formatNumber(startRatio, 3),
+    endRatio: formatNumber(startRatio + travelRatio, 3),
+    travelRatio: formatNumber(travelRatio, 3),
+  };
+}
+
+function buildImageMotionExpressions(sceneAnimation, {
+  durationSeconds,
+  totalFrames,
+  sourceWidth,
+  sourceHeight,
+}) {
+  const { progress, easedProgress } = buildProgressExpressions(totalFrames);
 
   switch (sceneAnimation.image_motion_preset) {
     case 'static_hold':
       return {
-        z: '1.02',
+        z: '1.015',
         x: 'iw/2-(iw/zoom/2)',
         y: 'ih/2-(ih/zoom/2)',
       };
     case 'slow_push_in': {
-      const finalZoom = sceneAnimation.speed === 'slow' ? 1.05 : 1.1;
+      const zoomDelta = sceneAnimation.speed === 'slow'
+        ? getDurationAwareZoomDelta(durationSeconds, {
+          minDelta: 0.018,
+          maxDelta: 0.06,
+          deltaPerSecond: 0.0011,
+        })
+        : getDurationAwareZoomDelta(durationSeconds, {
+          minDelta: 0.028,
+          maxDelta: 0.09,
+          deltaPerSecond: 0.00145,
+        });
+
       return {
-        z: `1+${formatNumber(finalZoom - 1)}*${easedProgress}`,
+        z: `1+${formatNumber(zoomDelta, 3)}*${easedProgress}`,
         x: 'iw/2-(iw/zoom/2)',
         y: 'ih/2-(ih/zoom/2)',
       };
     }
     case 'slow_pull_out': {
-      const initialZoom = sceneAnimation.speed === 'slow' ? 1.06 : 1.11;
+      const zoomDelta = sceneAnimation.speed === 'slow'
+        ? getDurationAwareZoomDelta(durationSeconds, {
+          minDelta: 0.02,
+          maxDelta: 0.065,
+          deltaPerSecond: 0.0012,
+        })
+        : getDurationAwareZoomDelta(durationSeconds, {
+          minDelta: 0.032,
+          maxDelta: 0.095,
+          deltaPerSecond: 0.00155,
+        });
+      const initialZoom = 1 + zoomDelta;
+
       return {
-        z: `${formatNumber(initialZoom)}-${formatNumber(initialZoom - 1)}*${easedProgress}`,
+        z: `${formatNumber(initialZoom, 3)}-${formatNumber(zoomDelta, 3)}*${easedProgress}`,
         x: 'iw/2-(iw/zoom/2)',
         y: 'ih/2-(ih/zoom/2)',
       };
     }
-    case 'pan_left_slow':
+    case 'pan_left_slow': {
+      const zoomLevel = getDurationAwareTravelFamilyZoomLevel(durationSeconds, 'pan', sceneAnimation.speed);
+      const travelBudget = buildDurationAwareTravelFamilyBudget({
+        durationSeconds,
+        sourceSize: sourceWidth,
+        zoomLevel,
+        familyName: 'pan',
+        speed: sceneAnimation.speed,
+      });
+
       return {
-        z: sceneAnimation.speed === 'slow' ? '1.05' : '1.08',
-        x: `(iw-iw/zoom)*(${centeredTravelProgress})`,
+        z: formatNumber(zoomLevel, 3),
+        x: `(iw-iw/zoom)*(${travelBudget.startRatio}+${travelBudget.travelRatio}*${easedProgress})`,
         y: 'ih/2-(ih/zoom/2)',
       };
-    case 'pan_right_slow':
+    }
+    case 'pan_right_slow': {
+      const zoomLevel = getDurationAwareTravelFamilyZoomLevel(durationSeconds, 'pan', sceneAnimation.speed);
+      const travelBudget = buildDurationAwareTravelFamilyBudget({
+        durationSeconds,
+        sourceSize: sourceWidth,
+        zoomLevel,
+        familyName: 'pan',
+        speed: sceneAnimation.speed,
+      });
+
       return {
-        z: sceneAnimation.speed === 'slow' ? '1.05' : '1.08',
-        x: `(iw-iw/zoom)*(${centeredTravelEndExpression}-${centeredTravelRangeExpression}*${easedProgress})`,
+        z: formatNumber(zoomLevel, 3),
+        x: `(iw-iw/zoom)*(${travelBudget.endRatio}-${travelBudget.travelRatio}*${easedProgress})`,
         y: 'ih/2-(ih/zoom/2)',
       };
-    case 'drift_up_soft':
+    }
+    case 'drift_up_soft': {
+      const zoomLevel = getDurationAwareTravelFamilyZoomLevel(durationSeconds, 'drift', sceneAnimation.speed);
+      const travelBudget = buildDurationAwareTravelFamilyBudget({
+        durationSeconds,
+        sourceSize: sourceHeight,
+        zoomLevel,
+        familyName: 'drift',
+        speed: sceneAnimation.speed,
+      });
+
       return {
-        z: sceneAnimation.speed === 'slow' ? '1.04' : '1.07',
+        z: formatNumber(zoomLevel, 3),
         x: 'iw/2-(iw/zoom/2)',
-        y: `(ih-ih/zoom)*(${centeredTravelEndExpression}-${centeredTravelRangeExpression}*${easedProgress})`,
+        y: `(ih-ih/zoom)*(${travelBudget.endRatio}-${travelBudget.travelRatio}*${easedProgress})`,
       };
-    case 'drift_down_soft':
+    }
+    case 'drift_down_soft': {
+      const zoomLevel = getDurationAwareTravelFamilyZoomLevel(durationSeconds, 'drift', sceneAnimation.speed);
+      const travelBudget = buildDurationAwareTravelFamilyBudget({
+        durationSeconds,
+        sourceSize: sourceHeight,
+        zoomLevel,
+        familyName: 'drift',
+        speed: sceneAnimation.speed,
+      });
+
       return {
-        z: sceneAnimation.speed === 'slow' ? '1.04' : '1.07',
+        z: formatNumber(zoomLevel, 3),
         x: 'iw/2-(iw/zoom/2)',
-        y: `(ih-ih/zoom)*(${centeredTravelProgress})`,
+        y: `(ih-ih/zoom)*(${travelBudget.startRatio}+${travelBudget.travelRatio}*${easedProgress})`,
       };
-    case 'parallax_float':
+    }
+    case 'parallax_float': {
+      const zoomLevel = getDurationAwareTravelFamilyZoomLevel(durationSeconds, 'parallax', sceneAnimation.speed);
+      const horizontalBudget = buildDurationAwareTravelFamilyBudget({
+        durationSeconds,
+        sourceSize: sourceWidth,
+        zoomLevel,
+        familyName: 'parallax',
+        speed: sceneAnimation.speed,
+      });
+      const verticalAmplitudeConfig = TRAVEL_MOTION_FAMILY_CONFIG.parallax.verticalAmplitude[sceneAnimation.speed];
+      const verticalSlack = Math.max(sourceHeight - (sourceHeight / zoomLevel), 1);
+      const verticalAmplitudeRatio = clampNumber(
+        (durationSeconds * verticalAmplitudeConfig.pixelsPerSecond) / verticalSlack,
+        verticalAmplitudeConfig.minAmplitudeRatio,
+        verticalAmplitudeConfig.maxAmplitudeRatio
+      );
+
       return {
-        z: sceneAnimation.speed === 'slow' ? '1.05' : '1.08',
-        x: '(iw-iw/zoom)*(0.5+0.04*sin(on/18))',
-        y: '(ih-ih/zoom)*(0.5+0.03*cos(on/24))',
+        z: formatNumber(zoomLevel, 3),
+        x: `(iw-iw/zoom)*(${horizontalBudget.startRatio}+${horizontalBudget.travelRatio}*${easedProgress})`,
+        y: `(ih-ih/zoom)*(0.5+${formatNumber(verticalAmplitudeRatio, 3)}*sin(${formatNumber(Math.PI, 6)}*${progress}))`,
       };
+    }
     default:
       throw new Error(`Unsupported image motion preset: ${sceneAnimation.image_motion_preset}`);
   }
 }
 
-function buildTextAnimationExpressions(sceneAnimation) {
+function buildTextAnimationExpressions(sceneAnimation, durationSeconds) {
   const baseX = '(w-text_w)/2';
   const baseY = getTextAnchorYExpression(sceneAnimation.text_anchor);
-  const textIntroDurationSeconds = 0.6;
+  const textIntroDurationSeconds = clampNumber(
+    durationSeconds * 0.1,
+    0.45,
+    sceneAnimation.speed === 'slow' ? 0.95 : 0.8
+  );
   const textIntroDuration = formatNumber(textIntroDurationSeconds, 3);
   const introProgress = `min(t/${textIntroDuration},1)`;
-  const introEase = `(${introProgress})*(${introProgress})*(3-2*(${introProgress}))`;
+  const introEase = buildSmootherStepExpression(introProgress);
   const introRemaining = `(1-${introEase})`;
   const fadeInAlpha = `if(lt(t,${textIntroDuration}),t/${textIntroDuration},1)`;
+  const verticalOffset = formatNumber(
+    clampNumber(durationSeconds * (sceneAnimation.speed === 'slow' ? 0.45 : 0.6), 22, 38),
+    3
+  );
+  const horizontalOffset = formatNumber(
+    clampNumber(durationSeconds * (sceneAnimation.speed === 'slow' ? 0.95 : 1.2), 44, 82),
+    3
+  );
+  const typeOnDelaySeconds = clampNumber(textIntroDurationSeconds * 0.18, 0.08, 0.16);
+  const typeOnDelay = formatNumber(typeOnDelaySeconds, 3);
+  const typeOnRevealSpan = formatNumber(Math.max(textIntroDurationSeconds - typeOnDelaySeconds, 0.2), 3);
 
   switch (sceneAnimation.text_motion_preset) {
     case 'fade_in_hold':
       return { x: baseX, y: baseY, alpha: fadeInAlpha };
     case 'fade_up_soft':
-      return { x: baseX, y: `${baseY}+28*${introRemaining}`, alpha: fadeInAlpha };
+      return { x: baseX, y: `${baseY}+${verticalOffset}*${introRemaining}`, alpha: fadeInAlpha };
     case 'slide_left_soft':
-      return { x: `${baseX}+60*${introRemaining}`, y: baseY, alpha: fadeInAlpha };
+      return { x: `${baseX}+${horizontalOffset}*${introRemaining}`, y: baseY, alpha: fadeInAlpha };
     case 'slide_right_soft':
-      return { x: `${baseX}-60*${introRemaining}`, y: baseY, alpha: fadeInAlpha };
+      return { x: `${baseX}-${horizontalOffset}*${introRemaining}`, y: baseY, alpha: fadeInAlpha };
     case 'type_on_soft':
-      return { x: baseX, y: baseY, alpha: 'if(lt(t,0.12),0,if(lt(t,0.6),(t-0.12)/0.48,1))' };
+      return { x: baseX, y: baseY, alpha: `if(lt(t,${typeOnDelay}),0,if(lt(t,${textIntroDuration}),(t-${typeOnDelay})/${typeOnRevealSpan},1))` };
     default:
       throw new Error(`Unsupported text motion preset: ${sceneAnimation.text_motion_preset}`);
   }
@@ -414,8 +628,13 @@ export function buildImageTextSceneFilterGraph({
   const totalFrames = Math.max(Math.round(normalizedDurationSeconds * normalizedFps), 2);
   const sourceWidth = Math.ceil(normalizedWidth * 1.25);
   const sourceHeight = Math.ceil(normalizedHeight * 1.25);
-  const imageMotion = buildImageMotionExpressions(normalizedSceneAnimation, totalFrames);
-  const textMotion = buildTextAnimationExpressions(normalizedSceneAnimation);
+  const imageMotion = buildImageMotionExpressions(normalizedSceneAnimation, {
+    durationSeconds: normalizedDurationSeconds,
+    totalFrames,
+    sourceWidth,
+    sourceHeight,
+  });
+  const textMotion = buildTextAnimationExpressions(normalizedSceneAnimation, normalizedDurationSeconds);
 
   return [
     `[0:v]scale=${sourceWidth}:${sourceHeight}:force_original_aspect_ratio=increase`,
