@@ -272,7 +272,7 @@ function buildImageMotionExpressions(sceneAnimation, totalFrames) {
   const lastFrameIndex = Math.max(totalFrames - 1, 1);
   const progress = `on/${lastFrameIndex}`;
   const easedProgress = `(${progress})*(${progress})*(3-2*(${progress}))`;
-  const motionProgress = `0.18*(${progress})+0.82*(${easedProgress})`;
+  const motionProgress = `0.06*(${progress})+0.94*(${easedProgress})`;
 
   switch (sceneAnimation.image_motion_preset) {
     case 'static_hold':
