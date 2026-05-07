@@ -10,6 +10,12 @@ import {
   joinVideoClips,
   probeAudioDuration,
 } from './ffmpeg-service.mjs';
+import {
+  getLogContext,
+  logError,
+  logInfo,
+  runWithLogContext,
+} from './logger.mjs';
 
 const PORT = Number(process.env.PORT || 3000);
 const MAX_JSON_BODY_BYTES = 1024 * 1024;
@@ -34,6 +40,76 @@ function sendBinary(response, statusCode, body, contentType, extraHeaders = {}) 
     ...extraHeaders,
   });
   response.end(body);
+}
+
+function getElapsedMilliseconds(startTime) {
+  return Number((process.hrtime.bigint() - startTime) / 1000000n);
+}
+
+function summarizeBinaryField(upload) {
+  if (!upload) {
+    return null;
+  }
+
+  return {
+    filename: upload.filename ?? upload.fileName,
+    mime_type: upload.mime_type ?? upload.mimeType,
+    size_bytes: upload.buffer?.length,
+  };
+}
+
+function sanitizeResult(result) {
+  return result == null
+    ? null
+    : Object.fromEntries(Object.entries(result).filter(([key]) => key !== 'buffer'));
+}
+
+function summarizeGenerateClipPayload(payload) {
+  return {
+    duration_seconds: payload.duration_seconds ?? payload.duration ?? undefined,
+    width: payload.width,
+    height: payload.height,
+    fps: payload.fps,
+    image_binary: summarizeBinaryField(payload.image_binary),
+    voiceover_binary: summarizeBinaryField(payload.voiceover_binary),
+    has_voiceover: payload.voiceover_binary != null,
+    overlay_text_length: payload.overlay_text?.length,
+    scene_animation: payload.scene_animation == null
+      ? undefined
+      : {
+        image_motion_preset: payload.scene_animation.image_motion_preset,
+        text_motion_preset: payload.scene_animation.text_motion_preset,
+        speed: payload.scene_animation.speed,
+        text_anchor: payload.scene_animation.text_anchor,
+      },
+  };
+}
+
+function summarizeJoinClipsPayload(payload) {
+  return {
+    clip_count: Array.isArray(payload.clips) ? payload.clips.length : undefined,
+    width: payload.width,
+    height: payload.height,
+    fps: payload.fps,
+    clips: Array.isArray(payload.clips)
+      ? payload.clips.map((clip) => ({
+        clip_path: clip.clip_path,
+        clip_binary: summarizeBinaryField(clip.clip_binary),
+        transition_to_next: clip.transition_to_next == null
+          ? undefined
+          : {
+            preset: clip.transition_to_next.preset,
+            duration_seconds: clip.transition_to_next.duration_seconds,
+          },
+      }))
+      : undefined,
+  };
+}
+
+function summarizeProbeAudioPayload(payload) {
+  return {
+    audio_binary: summarizeBinaryField(payload.audio_binary),
+  };
 }
 
 function getContentType(request) {
@@ -113,21 +189,41 @@ function matchJoinClipsJobPath(pathname) {
 export function createGenerateClipJobStore({ generateClipHandler = generateClip } = {}) {
   const jobs = new Map();
 
-  async function processJob(job, payload) {
-    job.status = 'running';
-    job.started_at = new Date().toISOString();
+  async function processJob(job, payload, logContext) {
+    await runWithLogContext(logContext, async () => {
+      job.status = 'running';
+      job.started_at = new Date().toISOString();
+      const startedAt = process.hrtime.bigint();
 
-    try {
-      job.result = await generateClipHandler(payload);
-      job.status = 'completed';
-      job.error = null;
-    } catch (error) {
-      job.status = 'failed';
-      job.error = error instanceof Error ? error.message : String(error);
-      job.result = null;
-    } finally {
-      job.completed_at = new Date().toISOString();
-    }
+      logInfo('job.started', {
+        job_id: job.job_id,
+        job_type: 'generate_clip',
+      });
+
+      try {
+        job.result = await generateClipHandler(payload);
+        job.status = 'completed';
+        job.error = null;
+        logInfo('job.completed', {
+          job_id: job.job_id,
+          job_type: 'generate_clip',
+          duration_ms: getElapsedMilliseconds(startedAt),
+          result: sanitizeResult(job.result),
+        });
+      } catch (error) {
+        job.status = 'failed';
+        job.error = error instanceof Error ? error.message : String(error);
+        job.result = null;
+        logError('job.failed', {
+          job_id: job.job_id,
+          job_type: 'generate_clip',
+          duration_ms: getElapsedMilliseconds(startedAt),
+          error: job.error,
+        });
+      } finally {
+        job.completed_at = new Date().toISOString();
+      }
+    });
   }
 
   return {
@@ -143,8 +239,18 @@ export function createGenerateClipJobStore({ generateClipHandler = generateClip 
       };
 
       jobs.set(job.job_id, job);
+      const inheritedLogContext = getLogContext();
+      logInfo('job.queued', {
+        job_id: job.job_id,
+        job_type: 'generate_clip',
+        payload: summarizeGenerateClipPayload(payload),
+      });
       queueMicrotask(() => {
-        void processJob(job, payload);
+        void processJob(job, payload, {
+          ...inheritedLogContext,
+          job_id: job.job_id,
+          job_type: 'generate_clip',
+        });
       });
 
       return job;
@@ -158,21 +264,41 @@ export function createGenerateClipJobStore({ generateClipHandler = generateClip 
 export function createJoinClipsJobStore({ joinVideoClipsHandler = joinVideoClips } = {}) {
   const jobs = new Map();
 
-  async function processJob(job, payload) {
-    job.status = 'running';
-    job.started_at = new Date().toISOString();
+  async function processJob(job, payload, logContext) {
+    await runWithLogContext(logContext, async () => {
+      job.status = 'running';
+      job.started_at = new Date().toISOString();
+      const startedAt = process.hrtime.bigint();
 
-    try {
-      job.result = await joinVideoClipsHandler(payload);
-      job.status = 'completed';
-      job.error = null;
-    } catch (error) {
-      job.status = 'failed';
-      job.error = error instanceof Error ? error.message : String(error);
-      job.result = null;
-    } finally {
-      job.completed_at = new Date().toISOString();
-    }
+      logInfo('job.started', {
+        job_id: job.job_id,
+        job_type: 'join_video_clips',
+      });
+
+      try {
+        job.result = await joinVideoClipsHandler(payload);
+        job.status = 'completed';
+        job.error = null;
+        logInfo('job.completed', {
+          job_id: job.job_id,
+          job_type: 'join_video_clips',
+          duration_ms: getElapsedMilliseconds(startedAt),
+          result: sanitizeResult(job.result),
+        });
+      } catch (error) {
+        job.status = 'failed';
+        job.error = error instanceof Error ? error.message : String(error);
+        job.result = null;
+        logError('job.failed', {
+          job_id: job.job_id,
+          job_type: 'join_video_clips',
+          duration_ms: getElapsedMilliseconds(startedAt),
+          error: job.error,
+        });
+      } finally {
+        job.completed_at = new Date().toISOString();
+      }
+    });
   }
 
   return {
@@ -188,8 +314,18 @@ export function createJoinClipsJobStore({ joinVideoClipsHandler = joinVideoClips
       };
 
       jobs.set(job.job_id, job);
+      const inheritedLogContext = getLogContext();
+      logInfo('job.queued', {
+        job_id: job.job_id,
+        job_type: 'join_video_clips',
+        payload: summarizeJoinClipsPayload(payload),
+      });
       queueMicrotask(() => {
-        void processJob(job, payload);
+        void processJob(job, payload, {
+          ...inheritedLogContext,
+          job_id: job.job_id,
+          job_type: 'join_video_clips',
+        });
       });
 
       return job;
@@ -471,171 +607,217 @@ export function createServer({
     joinVideoClipsHandler,
   });
 
-  return http.createServer(async (request, response) => {
+  return http.createServer((request, response) => {
     const url = new URL(request.url || '/', `http://${request.headers.host || 'localhost'}`);
+    const requestContext = {
+      request_id: randomUUID(),
+      http_method: request.method || 'GET',
+      http_path: url.pathname,
+    };
+    const startedAt = process.hrtime.bigint();
 
-    try {
-      if (request.method === 'GET' && url.pathname === '/health') {
-        sendJson(response, 200, await healthStatusHandler());
-        return;
-      }
-
-      if (request.method === 'GET' && url.pathname === '/v1/presets') {
-        sendJson(response, 200, presetCatalogHandler());
-        return;
-      }
-
-      if (request.method === 'POST' && url.pathname === '/v1/audio/probe-duration') {
-        const payload = await readProbeAudioBody(request, url);
-
-        sendJson(response, 200, {
-          ok: true,
-          ...await probeAudioDurationHandler(payload),
+    response.on('finish', () => {
+      void runWithLogContext(requestContext, async () => {
+        logInfo('http.request.completed', {
+          status_code: response.statusCode,
+          duration_ms: getElapsedMilliseconds(startedAt),
+          response_content_type: String(response.getHeader('content-type') || ''),
         });
-        return;
-      }
+      });
+    });
 
-      const jobMatch = matchGenerateClipJobPath(url.pathname);
-      if (request.method === 'GET' && jobMatch) {
-        const job = effectiveGenerateClipJobStore.get(jobMatch.jobId);
-        if (!job) {
-          sendJson(response, 404, {
-            ok: false,
-            error: `Render job ${jobMatch.jobId} was not found.`,
+    request.on('aborted', () => {
+      void runWithLogContext(requestContext, async () => {
+        logError('http.request.aborted', {
+          duration_ms: getElapsedMilliseconds(startedAt),
+        });
+      });
+    });
+
+    void runWithLogContext(requestContext, async () => {
+      logInfo('http.request.started', {
+        content_type: getContentType(request) || undefined,
+        content_length: request.headers['content-length'],
+      });
+
+      try {
+        if (request.method === 'GET' && url.pathname === '/health') {
+          sendJson(response, 200, await healthStatusHandler());
+          return;
+        }
+
+        if (request.method === 'GET' && url.pathname === '/v1/presets') {
+          sendJson(response, 200, presetCatalogHandler());
+          return;
+        }
+
+        if (request.method === 'POST' && url.pathname === '/v1/audio/probe-duration') {
+          const payload = await readProbeAudioBody(request, url);
+          logInfo('http.request.parsed', {
+            operation: 'probe_duration',
+            payload: summarizeProbeAudioPayload(payload),
+          });
+
+          sendJson(response, 200, {
+            ok: true,
+            ...await probeAudioDurationHandler(payload),
           });
           return;
         }
 
-        if (jobMatch.action === 'download') {
-          if (job.status !== 'completed' || job.result == null) {
-            sendJson(response, 409, {
+        const jobMatch = matchGenerateClipJobPath(url.pathname);
+        if (request.method === 'GET' && jobMatch) {
+          const job = effectiveGenerateClipJobStore.get(jobMatch.jobId);
+          if (!job) {
+            sendJson(response, 404, {
               ok: false,
-              error: job.status === 'failed'
-                ? job.error || 'Render job failed.'
-                : 'Render job is not completed yet.',
-              ...buildGenerateClipJobPayload(job),
+              error: `Render job ${jobMatch.jobId} was not found.`,
             });
             return;
           }
 
-          sendBinary(
-            response,
-            200,
-            job.result.buffer,
-            job.result.content_type,
-            {
-              'content-disposition': `inline; filename="${job.result.filename}"`,
+          if (jobMatch.action === 'download') {
+            if (job.status !== 'completed' || job.result == null) {
+              sendJson(response, 409, {
+                ok: false,
+                error: job.status === 'failed'
+                  ? job.error || 'Render job failed.'
+                  : 'Render job is not completed yet.',
+                ...buildGenerateClipJobPayload(job),
+              });
+              return;
             }
-          );
-          return;
-        }
 
-        sendJson(response, 200, {
-          ok: true,
-          job: 'generate_clip',
-          ...buildGenerateClipJobPayload(job),
-        });
-        return;
-      }
+            sendBinary(
+              response,
+              200,
+              job.result.buffer,
+              job.result.content_type,
+              {
+                'content-disposition': `inline; filename="${job.result.filename}"`,
+              }
+            );
+            return;
+          }
 
-      const joinClipsJobMatch = matchJoinClipsJobPath(url.pathname);
-      if (request.method === 'GET' && joinClipsJobMatch) {
-        const job = effectiveJoinClipsJobStore.get(joinClipsJobMatch.jobId);
-        if (!job) {
-          sendJson(response, 404, {
-            ok: false,
-            error: `Compose job ${joinClipsJobMatch.jobId} was not found.`,
+          sendJson(response, 200, {
+            ok: true,
+            job: 'generate_clip',
+            ...buildGenerateClipJobPayload(job),
           });
           return;
         }
 
-        if (joinClipsJobMatch.action === 'download') {
-          if (job.status !== 'completed' || job.result == null) {
-            sendJson(response, 409, {
+        const joinClipsJobMatch = matchJoinClipsJobPath(url.pathname);
+        if (request.method === 'GET' && joinClipsJobMatch) {
+          const job = effectiveJoinClipsJobStore.get(joinClipsJobMatch.jobId);
+          if (!job) {
+            sendJson(response, 404, {
               ok: false,
-              error: job.status === 'failed'
-                ? job.error || 'Compose job failed.'
-                : 'Compose job is not completed yet.',
-              ...buildJoinClipsJobPayload(job),
+              error: `Compose job ${joinClipsJobMatch.jobId} was not found.`,
             });
             return;
           }
 
-          sendBinary(
-            response,
-            200,
-            job.result.buffer,
-            job.result.content_type,
-            {
-              'content-disposition': `inline; filename="${job.result.filename}"`,
+          if (joinClipsJobMatch.action === 'download') {
+            if (job.status !== 'completed' || job.result == null) {
+              sendJson(response, 409, {
+                ok: false,
+                error: job.status === 'failed'
+                  ? job.error || 'Compose job failed.'
+                  : 'Compose job is not completed yet.',
+                ...buildJoinClipsJobPayload(job),
+              });
+              return;
             }
-          );
+
+            sendBinary(
+              response,
+              200,
+              job.result.buffer,
+              job.result.content_type,
+              {
+                'content-disposition': `inline; filename="${job.result.filename}"`,
+              }
+            );
+            return;
+          }
+
+          sendJson(response, 200, {
+            ok: true,
+            job: 'join_video_clips',
+            ...buildJoinClipsJobPayload(job),
+          });
           return;
         }
 
-        sendJson(response, 200, {
-          ok: true,
-          job: 'join_video_clips',
-          ...buildJoinClipsJobPayload(job),
+        if (request.method === 'POST' && url.pathname === '/v1/render/generate-clip') {
+          const payload = await readGenerateClipBody(request, url);
+          logInfo('http.request.parsed', {
+            operation: 'generate_clip',
+            payload: summarizeGenerateClipPayload(payload),
+          });
+
+          const job = effectiveGenerateClipJobStore.enqueue(payload);
+          const jobPayload = buildGenerateClipJobPayload(job);
+
+          sendJson(response, 202, {
+            ok: true,
+            async: true,
+            job: 'generate_clip',
+            ...jobPayload,
+          }, {
+            location: jobPayload.status_path,
+          });
+          return;
+        }
+
+        if (request.method === 'POST' && url.pathname === '/v1/compose/join-clips') {
+          const payload = await readJoinClipsBody(request, url);
+          logInfo('http.request.parsed', {
+            operation: 'join_clips',
+            payload: summarizeJoinClipsPayload(payload),
+          });
+
+          const job = effectiveJoinClipsJobStore.enqueue(payload);
+          const jobPayload = buildJoinClipsJobPayload(job);
+
+          sendJson(response, 202, {
+            ok: true,
+            async: true,
+            job: 'join_video_clips',
+            ...jobPayload,
+          }, {
+            location: jobPayload.status_path,
+          });
+          return;
+        }
+
+        sendJson(response, 404, {
+          ok: false,
+          error: 'Not found.',
+          available_routes: [
+            'GET /health',
+            'GET /v1/presets',
+            'POST /v1/audio/probe-duration',
+            'POST /v1/render/generate-clip',
+            'GET /v1/render/jobs/<job_id>',
+            'GET /v1/render/jobs/<job_id>/download',
+            'POST /v1/compose/join-clips',
+            'GET /v1/compose/jobs/<job_id>',
+            'GET /v1/compose/jobs/<job_id>/download',
+          ],
         });
-        return;
-      }
-
-      if (request.method === 'POST' && url.pathname === '/v1/render/generate-clip') {
-        const payload = await readGenerateClipBody(request, url);
-
-        const job = effectiveGenerateClipJobStore.enqueue(payload);
-        const jobPayload = buildGenerateClipJobPayload(job);
-
-        sendJson(response, 202, {
-          ok: true,
-          async: true,
-          job: 'generate_clip',
-          ...jobPayload,
-        }, {
-          location: jobPayload.status_path,
+      } catch (error) {
+        logError('http.request.failed', {
+          error: error.message,
         });
-        return;
-      }
-
-      if (request.method === 'POST' && url.pathname === '/v1/compose/join-clips') {
-        const payload = await readJoinClipsBody(request, url);
-
-        const job = effectiveJoinClipsJobStore.enqueue(payload);
-        const jobPayload = buildJoinClipsJobPayload(job);
-
-        sendJson(response, 202, {
-          ok: true,
-          async: true,
-          job: 'join_video_clips',
-          ...jobPayload,
-        }, {
-          location: jobPayload.status_path,
+        sendJson(response, 400, {
+          ok: false,
+          error: error.message,
         });
-        return;
       }
-
-      sendJson(response, 404, {
-        ok: false,
-        error: 'Not found.',
-        available_routes: [
-          'GET /health',
-          'GET /v1/presets',
-          'POST /v1/audio/probe-duration',
-          'POST /v1/render/generate-clip',
-          'GET /v1/render/jobs/<job_id>',
-          'GET /v1/render/jobs/<job_id>/download',
-          'POST /v1/compose/join-clips',
-          'GET /v1/compose/jobs/<job_id>',
-          'GET /v1/compose/jobs/<job_id>/download',
-        ],
-      });
-    } catch (error) {
-      sendJson(response, 400, {
-        ok: false,
-        error: error.message,
-      });
-    }
+    });
   });
 }
 
@@ -644,6 +826,9 @@ const modulePath = fileURLToPath(import.meta.url);
 if (process.argv[1] && path.resolve(process.argv[1]) === modulePath) {
   const server = createServer();
   server.listen(PORT, () => {
-    console.log(`ffmpeg-api listening on http://0.0.0.0:${PORT}`);
+    logInfo('server.started', {
+      port: PORT,
+      bind: '0.0.0.0',
+    });
   });
 }
