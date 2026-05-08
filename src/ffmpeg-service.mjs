@@ -935,13 +935,19 @@ export function buildImageTextSceneFilterGraph({
   });
   const textMotion = buildTextAnimationExpressions(normalizedSceneAnimation, normalizedDurationSeconds);
 
-  return [
+  const imageChain = [
     `[0:v]scale=${sourceWidth}:${sourceHeight}:force_original_aspect_ratio=increase`,
     `crop=${sourceWidth}:${sourceHeight}`,
     `zoompan=z='${escapeExpression(imageMotion.z)}':x='${escapeExpression(imageMotion.x)}':y='${escapeExpression(imageMotion.y)}':d=${totalFrames}:s=${normalizedWidth}x${normalizedHeight}:fps=${normalizedFps}`,
-    `drawtext=fontfile='${escapeFilterLiteral(fontFile)}':text='${escapeDrawtextText(normalizedOverlayText)}':fontcolor=${fontColor}:fontsize=${normalizedFontSize}:x='${escapeExpression(textMotion.x)}':y='${escapeExpression(textMotion.y)}':alpha='${escapeExpression(textMotion.alpha)}':borderw=4:bordercolor=${borderColor}:shadowcolor=black@0.85:shadowx=2:shadowy=2:line_spacing=8`,
+    `tmix=frames=2:weights='1 1'[img]`,
+  ].join(',');
+
+  const textChain = [
+    `[img]drawtext=fontfile='${escapeFilterLiteral(fontFile)}':text='${escapeDrawtextText(normalizedOverlayText)}':fontcolor=${fontColor}:fontsize=${normalizedFontSize}:x='${escapeExpression(textMotion.x)}':y='${escapeExpression(textMotion.y)}':alpha='${escapeExpression(textMotion.alpha)}':borderw=4:bordercolor=${borderColor}:shadowcolor=black@0.85:shadowx=2:shadowy=2:line_spacing=8`,
     'format=yuv420p[vout]',
   ].join(',');
+
+  return `${imageChain};${textChain}`;
 }
 
 function normalizeClipEntry(clip, index) {
