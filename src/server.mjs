@@ -24,6 +24,8 @@ import {
   runWithLogContext,
 } from './logger.mjs';
 import {
+  adjustManagedStorageUsageBytes,
+  primeManagedStorageUsageBytes,
   reserveManagedStorageBytes,
   resolveManagedStorageMaxBytes,
   resolveManagedStorageRoot,
@@ -39,6 +41,7 @@ const DEFAULT_ASYNC_JOB_MAX_CONCURRENCY = 1;
 const DEFAULT_ASYNC_JOB_MAX_QUEUE = 8;
 const DEFAULT_READINESS_CACHE_TTL_MS = 30 * 1000;
 const DEFAULT_SHUTDOWN_GRACE_MS = 10 * 1000;
+const DEFAULT_MULTIPART_STORAGE_SYNC_THRESHOLD_BYTES = 64 * 1024;
 const ASYNC_JOB_RESULT_DIR_PREFIX = 'ffmpeg-api-job-result-';
 const MULTIPART_UPLOAD_DIR_PREFIX = 'ffmpeg-api-upload-';
 const GENERATE_CLIP_JOB_PATH_PATTERN = /^\/v1\/render\/jobs\/([^/]+?)(?:\/(download))?$/;
@@ -73,6 +76,17 @@ function resolveNonNegativeIntegerOption(value, optionName, fallback) {
 
 function resolveShutdownGraceMs(value = process.env.SHUTDOWN_GRACE_MS) {
   return resolveNonNegativeIntegerOption(value, 'SHUTDOWN_GRACE_MS', DEFAULT_SHUTDOWN_GRACE_MS);
+}
+
+function resolveMultipartStorageSyncThresholdBytes(
+  value = process.env.MULTIPART_STORAGE_SYNC_THRESHOLD_BYTES,
+  optionName = 'multipartStorageSyncThresholdBytes'
+) {
+  return resolveNonNegativeIntegerOption(
+    value,
+    optionName,
+    DEFAULT_MULTIPART_STORAGE_SYNC_THRESHOLD_BYTES
+  );
 }
 
 function canWriteResponse(response) {
@@ -166,10 +180,16 @@ async function persistJobResult(result, { jobId, jobType, storageRoot, storageMa
     }
 
     if (stagedTempDir != null && isPathInsideDirectory(stagedTempDir, storageRoot)) {
+      await adjustManagedStorageUsageBytes({
+        storageRoot,
+        deltaBytes: sourceStats.size,
+      });
+
       return {
         result: sanitizeResult(result),
         file_path: stagedFilePath,
         temp_dir: stagedTempDir,
+        size_bytes: sourceStats.size,
       };
     }
 
@@ -184,6 +204,10 @@ async function persistJobResult(result, { jobId, jobType, storageRoot, storageMa
 
     try {
       await pipeline(createReadStream(stagedFilePath), createWriteStream(filePath));
+      await adjustManagedStorageUsageBytes({
+        storageRoot,
+        deltaBytes: sourceStats.size,
+      });
       if (stagedTempDir != null) {
         await rm(stagedTempDir, { recursive: true, force: true });
       }
@@ -192,6 +216,7 @@ async function persistJobResult(result, { jobId, jobType, storageRoot, storageMa
         result: sanitizeResult(result),
         file_path: filePath,
         temp_dir: tempDir,
+        size_bytes: sourceStats.size,
       };
     } catch (error) {
       await rm(tempDir, { recursive: true, force: true });
@@ -221,10 +246,16 @@ async function persistJobResult(result, { jobId, jobType, storageRoot, storageMa
 
   try {
     await writeFile(filePath, outputBuffer);
+    await adjustManagedStorageUsageBytes({
+      storageRoot,
+      deltaBytes: outputBuffer.length,
+    });
+
     return {
       result: sanitizeResult(result),
       file_path: filePath,
       temp_dir: tempDir,
+      size_bytes: outputBuffer.length,
     };
   } catch (error) {
     await rm(tempDir, { recursive: true, force: true });
@@ -439,6 +470,7 @@ function buildGenerateClipJobPayload(job) {
     expires_at_ms,
     result_file_path,
     result_temp_dir,
+    result_size_bytes,
     payload_cleanup,
     execution_promise,
     cancellation_status,
@@ -463,6 +495,7 @@ function buildJoinClipsJobPayload(job) {
     expires_at_ms,
     result_file_path,
     result_temp_dir,
+    result_size_bytes,
     payload_cleanup,
     execution_promise,
     cancellation_status,
@@ -667,11 +700,19 @@ function createAsyncBinaryJobStore({
   async function cleanupJobArtifacts(job) {
     if (job?.result_temp_dir != null) {
       await rm(job.result_temp_dir, { recursive: true, force: true });
+
+      if (job.result_size_bytes != null && job.result_size_bytes > 0) {
+        await adjustManagedStorageUsageBytes({
+          storageRoot: effectiveStorageRoot,
+          deltaBytes: -job.result_size_bytes,
+        });
+      }
     }
 
     if (job) {
       job.result_temp_dir = null;
       job.result_file_path = null;
+      job.result_size_bytes = null;
     }
   }
 
@@ -774,6 +815,7 @@ function createAsyncBinaryJobStore({
       });
 
       try {
+        await primeManagedStorageUsageBytes(effectiveStorageRoot);
         const rawResult = await handler(payload);
         if (job.cancellation_status != null) {
           throw new Error(job.cancellation_reason ?? 'Job cancelled.');
@@ -789,6 +831,7 @@ function createAsyncBinaryJobStore({
         job.result = persistedResult.result;
         job.result_file_path = persistedResult.file_path;
         job.result_temp_dir = persistedResult.temp_dir;
+        job.result_size_bytes = persistedResult.size_bytes ?? null;
         if (job.cancellation_status != null) {
           throw new Error(job.cancellation_reason ?? 'Job cancelled.');
         }
@@ -850,6 +893,7 @@ function createAsyncBinaryJobStore({
         result: null,
         result_file_path: null,
         result_temp_dir: null,
+        result_size_bytes: null,
         payload_cleanup: payloadCleanup,
         execution_promise: null,
         cancellation_status: null,
@@ -1104,6 +1148,7 @@ function buildMultipartFileEntry(filePath, info, sizeBytes) {
 async function readMultipartFormData(request, url, maxBodyBytes, {
   storageRoot = process.env.ASYNC_JOB_STORAGE_ROOT,
   storageMaxBytes = process.env.FFMPEG_STORAGE_MAX_BYTES,
+  multipartStorageSyncThresholdBytes = process.env.MULTIPART_STORAGE_SYNC_THRESHOLD_BYTES,
 } = {}) {
   void url;
 
@@ -1114,6 +1159,10 @@ async function readMultipartFormData(request, url, maxBodyBytes, {
 
   const effectiveStorageRoot = resolveAsyncJobStorageRoot(storageRoot);
   const effectiveStorageMaxBytes = resolveManagedStorageMaxBytes(storageMaxBytes);
+  const effectiveMultipartStorageSyncThresholdBytes = resolveMultipartStorageSyncThresholdBytes(
+    multipartStorageSyncThresholdBytes,
+    'multipartStorageSyncThresholdBytes'
+  );
   const storageReservation = declaredContentLength == null
     ? null
     : await reserveManagedStorageBytes({
@@ -1154,6 +1203,8 @@ async function readMultipartFormData(request, url, maxBodyBytes, {
     let dynamicStorageSyncRequested = false;
     let dynamicStorageSyncInFlight = false;
     let dynamicStorageSyncPromise = Promise.resolve();
+    let lastSyncedAccountedMultipartBytes = 0;
+    let lastSyncedPersistedMultipartFileBytes = 0;
 
     function refreshWriterProgress(writerState) {
       const writtenBytes = writerState.writeStream.bytesWritten;
@@ -1175,9 +1226,34 @@ async function readMultipartFormData(request, url, maxBodyBytes, {
       return Math.max(0, observedMultipartFileBytes - persistedMultipartFileBytes);
     }
 
-    function syncChunkStorageCapacity() {
+    function getAccountedMultipartBytes() {
+      return persistedMultipartFileBytes + getPendingMultipartBytes();
+    }
+
+    function shouldSyncChunkStorageCapacity({ force = false } = {}) {
+      if (force) {
+        return true;
+      }
+
+      const accountedMultipartBytes = getAccountedMultipartBytes();
+      if (accountedMultipartBytes < lastSyncedAccountedMultipartBytes) {
+        return true;
+      }
+
+      if (effectiveMultipartStorageSyncThresholdBytes === 0) {
+        return accountedMultipartBytes !== lastSyncedAccountedMultipartBytes;
+      }
+
+      return accountedMultipartBytes - lastSyncedAccountedMultipartBytes >= effectiveMultipartStorageSyncThresholdBytes;
+    }
+
+    function syncChunkStorageCapacity({ force = false } = {}) {
       if (dynamicStorageReservation == null) {
         return Promise.resolve();
+      }
+
+      if (!shouldSyncChunkStorageCapacity({ force })) {
+        return dynamicStorageSyncPromise;
       }
 
       dynamicStorageSyncRequested = true;
@@ -1196,6 +1272,8 @@ async function readMultipartFormData(request, url, maxBodyBytes, {
             await dynamicStorageReservation.setBytes(getPendingMultipartBytes(), {
               usageBytes: dynamicStorageBaselineUsageBytes + persistedMultipartFileBytes,
             });
+            lastSyncedAccountedMultipartBytes = getAccountedMultipartBytes();
+            lastSyncedPersistedMultipartFileBytes = persistedMultipartFileBytes;
           }
         } catch (error) {
           rejectOnce(error);
@@ -1212,6 +1290,14 @@ async function readMultipartFormData(request, url, maxBodyBytes, {
       await Promise.allSettled([...fileWritePromises]);
       await Promise.allSettled([dynamicStorageSyncPromise]);
       await rm(tempDir, { recursive: true, force: true });
+
+      if (dynamicStorageReservation != null && lastSyncedPersistedMultipartFileBytes > 0) {
+        await adjustManagedStorageUsageBytes({
+          storageRoot: effectiveStorageRoot,
+          deltaBytes: -lastSyncedPersistedMultipartFileBytes,
+        });
+      }
+
       dynamicStorageReservation?.release();
       storageReservation?.release();
     }
@@ -1268,7 +1354,7 @@ async function readMultipartFormData(request, url, maxBodyBytes, {
       }
 
       void Promise.all([...fileWritePromises])
-        .then(() => syncChunkStorageCapacity())
+        .then(() => syncChunkStorageCapacity({ force: true }))
         .then(() => dynamicStorageSyncPromise)
         .then(() => {
           if (settled) {
@@ -1537,6 +1623,7 @@ export function createServer({
   asyncJobMaxConcurrency = process.env.ASYNC_JOB_MAX_CONCURRENCY,
   asyncJobMaxQueue = process.env.ASYNC_JOB_MAX_QUEUE,
   readinessCacheTtlMs = process.env.READINESS_CACHE_TTL_MS,
+  multipartStorageSyncThresholdBytes = process.env.MULTIPART_STORAGE_SYNC_THRESHOLD_BYTES,
 } = {}) {
   const effectiveMaxJoinClipsBodyBytes = resolvePositiveIntegerOption(
     maxJoinClipsBodyBytes,
@@ -1640,19 +1727,27 @@ export function createServer({
           const payload = await readProbeAudioBody(request, url, {
             storageRoot: asyncJobStorageRoot,
             storageMaxBytes,
+            multipartStorageSyncThresholdBytes,
           });
           logInfo('http.request.parsed', {
             operation: 'probe_duration',
             payload: summarizeProbeAudioPayload(payload),
           });
 
+          let payloadCleaned = false;
           try {
+            const probeResult = await probeAudioDurationHandler(payload);
+            await cleanupPayload(payload);
+            payloadCleaned = true;
+
             sendJson(response, 200, {
               ok: true,
-              ...await probeAudioDurationHandler(payload),
+              ...probeResult,
             });
           } finally {
-            await cleanupPayload(payload);
+            if (!payloadCleaned) {
+              await cleanupPayload(payload);
+            }
           }
           return;
         }
@@ -1830,6 +1925,7 @@ export function createServer({
           const payload = await readGenerateClipBody(request, url, {
             storageRoot: asyncJobStorageRoot,
             storageMaxBytes,
+            multipartStorageSyncThresholdBytes,
           });
           logInfo('http.request.parsed', {
             operation: 'generate_clip',
@@ -1861,6 +1957,7 @@ export function createServer({
           const payload = await readJoinClipsBody(request, url, effectiveMaxJoinClipsBodyBytes, {
             storageRoot: asyncJobStorageRoot,
             storageMaxBytes,
+            multipartStorageSyncThresholdBytes,
           });
           logInfo('http.request.parsed', {
             operation: 'join_clips',
