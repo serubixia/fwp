@@ -20,10 +20,23 @@ import {
 const PORT = Number(process.env.PORT || 3000);
 const MAX_JSON_BODY_BYTES = 1024 * 1024;
 const MAX_GENERATE_CLIP_BODY_BYTES = 64 * 1024 * 1024;
-const MAX_JOIN_CLIPS_BODY_BYTES = 64 * 1024 * 1024;
+const DEFAULT_MAX_JOIN_CLIPS_BODY_BYTES = 256 * 1024 * 1024;
 const MAX_PROBE_AUDIO_BODY_BYTES = 64 * 1024 * 1024;
 const GENERATE_CLIP_JOB_PATH_PATTERN = /^\/v1\/render\/jobs\/([^/]+?)(?:\/(download))?$/;
 const JOIN_CLIPS_JOB_PATH_PATTERN = /^\/v1\/compose\/jobs\/([^/]+?)(?:\/(download))?$/;
+
+function resolvePositiveByteLimit(value, optionName, fallback) {
+  if (value == null || value === '') {
+    return fallback;
+  }
+
+  const parsedValue = Number(value);
+  if (!Number.isInteger(parsedValue) || parsedValue <= 0) {
+    throw new Error(`${optionName} must be a positive integer.`);
+  }
+
+  return parsedValue;
+}
 
 function sendJson(response, statusCode, payload, extraHeaders = {}) {
   response.writeHead(statusCode, {
@@ -340,12 +353,25 @@ function readBodyBuffer(request, maxBodyBytes) {
   return new Promise((resolve, reject) => {
     const chunks = [];
     let totalBytes = 0;
+    let settled = false;
+
+    function rejectOnce(error) {
+      if (settled) {
+        return;
+      }
+
+      settled = true;
+      reject(error);
+    }
 
     request.on('data', (chunk) => {
+      if (settled) {
+        return;
+      }
+
       totalBytes += chunk.length;
       if (totalBytes > maxBodyBytes) {
-        reject(new Error(`Request body exceeds the ${maxBodyBytes} byte limit.`));
-        request.destroy();
+        rejectOnce(new Error(`Request body exceeds the ${maxBodyBytes} byte limit.`));
         return;
       }
 
@@ -353,10 +379,15 @@ function readBodyBuffer(request, maxBodyBytes) {
     });
 
     request.on('end', () => {
+      if (settled) {
+        return;
+      }
+
+      settled = true;
       resolve(Buffer.concat(chunks));
     });
 
-    request.on('error', reject);
+    request.on('error', rejectOnce);
   });
 }
 
@@ -525,8 +556,8 @@ function normalizeJoinClipBinaryFieldName(value, index) {
   return value.trim();
 }
 
-async function readJoinClipsMultipartBody(request, url) {
-  const formData = await readMultipartFormData(request, url, MAX_JOIN_CLIPS_BODY_BYTES);
+async function readJoinClipsMultipartBody(request, url, maxBodyBytes = DEFAULT_MAX_JOIN_CLIPS_BODY_BYTES) {
+  const formData = await readMultipartFormData(request, url, maxBodyBytes);
   const clipsManifest = readFormJsonField(formData, 'clips', { required: true });
 
   if (!Array.isArray(clipsManifest) || clipsManifest.length === 0) {
@@ -581,11 +612,11 @@ async function readJoinClipsMultipartBody(request, url) {
   };
 }
 
-async function readJoinClipsBody(request, url) {
+async function readJoinClipsBody(request, url, maxBodyBytes = DEFAULT_MAX_JOIN_CLIPS_BODY_BYTES) {
   const contentType = getContentType(request);
 
   if (contentType.includes('multipart/form-data')) {
-    return readJoinClipsMultipartBody(request, url);
+    return readJoinClipsMultipartBody(request, url, maxBodyBytes);
   }
 
   throw new Error('join-clips only accepts multipart/form-data with binary file fields.');
@@ -599,7 +630,13 @@ export function createServer({
   presetCatalogHandler = getPresetCatalog,
   generateClipJobStore,
   joinClipsJobStore,
+  maxJoinClipsBodyBytes = process.env.MAX_JOIN_CLIPS_BODY_BYTES,
 } = {}) {
+  const effectiveMaxJoinClipsBodyBytes = resolvePositiveByteLimit(
+    maxJoinClipsBodyBytes,
+    'maxJoinClipsBodyBytes',
+    DEFAULT_MAX_JOIN_CLIPS_BODY_BYTES
+  );
   const effectiveGenerateClipJobStore = generateClipJobStore ?? createGenerateClipJobStore({
     generateClipHandler,
   });
@@ -773,7 +810,7 @@ export function createServer({
         }
 
         if (request.method === 'POST' && url.pathname === '/v1/compose/join-clips') {
-          const payload = await readJoinClipsBody(request, url);
+          const payload = await readJoinClipsBody(request, url, effectiveMaxJoinClipsBodyBytes);
           logInfo('http.request.parsed', {
             operation: 'join_clips',
             payload: summarizeJoinClipsPayload(payload),
