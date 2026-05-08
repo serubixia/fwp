@@ -4,22 +4,49 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 
 const MANAGED_STORAGE_ENTRY_PREFIX = 'ffmpeg-api-';
-const storageReservations = new Map();
+const storageStates = new Map();
 
-function getReservationRegistry(storageRoot) {
-  const existingRegistry = storageReservations.get(storageRoot);
-  if (existingRegistry != null) {
-    return existingRegistry;
+function getStorageState(storageRoot) {
+  const existingState = storageStates.get(storageRoot);
+  if (existingState != null) {
+    return existingState;
   }
 
-  const reservationRegistry = new Map();
-  storageReservations.set(storageRoot, reservationRegistry);
-  return reservationRegistry;
+  const storageState = {
+    reservationRegistry: new Map(),
+    usageBytes: null,
+    usageLoadPromise: null,
+  };
+  storageStates.set(storageRoot, storageState);
+  return storageState;
 }
 
-function getReservedBytes(storageRoot) {
-  return [...getReservationRegistry(storageRoot).values()]
+function cleanupStorageStateIfUnused(storageRoot, storageState) {
+  if (
+    storageState.reservationRegistry.size === 0
+    && storageState.usageBytes === 0
+    && storageState.usageLoadPromise == null
+  ) {
+    storageStates.delete(storageRoot);
+  }
+}
+
+function getReservedBytes(storageState) {
+  return [...storageState.reservationRegistry.values()]
     .reduce((totalBytes, reservedBytes) => totalBytes + reservedBytes, 0);
+}
+
+function ensureInteger(value, label, fallback) {
+  if (value == null || value === '') {
+    return fallback;
+  }
+
+  const parsedValue = Number(value);
+  if (!Number.isInteger(parsedValue)) {
+    throw new Error(`${label} must be an integer.`);
+  }
+
+  return parsedValue;
 }
 
 function ensureNonNegativeInteger(value, label, fallback) {
@@ -80,6 +107,49 @@ async function getManagedStorageUsageBytes(storageRoot = resolveManagedStorageRo
   return managedEntrySizes.reduce((totalBytes, managedEntryBytes) => totalBytes + managedEntryBytes, 0);
 }
 
+export async function primeManagedStorageUsageBytes(storageRoot = resolveManagedStorageRoot()) {
+  await ensureManagedStorageRoot(storageRoot);
+  const storageState = getStorageState(storageRoot);
+
+  if (storageState.usageBytes != null) {
+    return storageState.usageBytes;
+  }
+
+  if (storageState.usageLoadPromise != null) {
+    return storageState.usageLoadPromise;
+  }
+
+  storageState.usageLoadPromise = getManagedStorageUsageBytes(storageRoot)
+    .then((usageBytes) => {
+      storageState.usageBytes = usageBytes;
+      return usageBytes;
+    })
+    .finally(() => {
+      storageState.usageLoadPromise = null;
+      cleanupStorageStateIfUnused(storageRoot, storageState);
+    });
+
+  return storageState.usageLoadPromise;
+}
+
+export async function adjustManagedStorageUsageBytes({
+  storageRoot = resolveManagedStorageRoot(),
+  deltaBytes = 0,
+} = {}) {
+  const normalizedDeltaBytes = ensureInteger(deltaBytes, 'managed storage usage delta bytes', 0);
+  const initialUsageBytes = await primeManagedStorageUsageBytes(storageRoot);
+  const storageState = getStorageState(storageRoot);
+  const nextUsageBytes = initialUsageBytes + normalizedDeltaBytes;
+
+  if (nextUsageBytes < 0) {
+    throw new Error('Managed storage usage bytes cannot be negative.');
+  }
+
+  storageState.usageBytes = nextUsageBytes;
+  cleanupStorageStateIfUnused(storageRoot, storageState);
+  return nextUsageBytes;
+}
+
 function createStorageQuotaExceededError({
   storageRoot,
   maxBytes,
@@ -128,14 +198,13 @@ export async function reserveManagedStorageBytes({
     };
   }
 
-  await ensureManagedStorageRoot(storageRoot);
-  const initialUsageBytes = await getManagedStorageUsageBytes(storageRoot);
-  const reservationRegistry = getReservationRegistry(storageRoot);
+  const initialUsageBytes = await primeManagedStorageUsageBytes(storageRoot);
+  const storageState = getStorageState(storageRoot);
   const reservationId = randomUUID();
   let released = false;
   let currentBytes = 0;
   let currentUsageBytes = initialUsageBytes;
-  reservationRegistry.set(reservationId, currentBytes);
+  storageState.reservationRegistry.set(reservationId, currentBytes);
 
   async function setBytes(nextBytes, { usageBytes } = {}) {
     const targetBytes = ensureNonNegativeInteger(nextBytes, 'managed storage reservation bytes', 0);
@@ -143,10 +212,13 @@ export async function reserveManagedStorageBytes({
       throw new Error('Managed storage reservation was already released.');
     }
 
-    const effectiveUsageBytes = usageBytes == null
-      ? await getManagedStorageUsageBytes(storageRoot)
+    const nextUsageBytes = usageBytes == null
+      ? null
       : ensureNonNegativeInteger(usageBytes, 'managed storage usage bytes', 0);
-    const reservedBytes = Math.max(0, getReservedBytes(storageRoot) - currentBytes);
+    const effectiveUsageBytes = nextUsageBytes == null
+      ? storageState.usageBytes
+      : storageState.usageBytes + (nextUsageBytes - currentUsageBytes);
+    const reservedBytes = Math.max(0, getReservedBytes(storageState) - currentBytes);
     if (effectiveUsageBytes + reservedBytes + targetBytes > maxBytes) {
       throw createStorageQuotaExceededError({
         storageRoot,
@@ -157,18 +229,20 @@ export async function reserveManagedStorageBytes({
       });
     }
 
-    currentUsageBytes = effectiveUsageBytes;
+    if (nextUsageBytes != null) {
+      currentUsageBytes = nextUsageBytes;
+      storageState.usageBytes = effectiveUsageBytes;
+    }
+
     currentBytes = targetBytes;
-    reservationRegistry.set(reservationId, currentBytes);
+    storageState.reservationRegistry.set(reservationId, currentBytes);
   }
 
   try {
     await setBytes(requestedBytes, { usageBytes: initialUsageBytes });
   } catch (error) {
-    reservationRegistry.delete(reservationId);
-    if (reservationRegistry.size === 0) {
-      storageReservations.delete(storageRoot);
-    }
+    storageState.reservationRegistry.delete(reservationId);
+    cleanupStorageStateIfUnused(storageRoot, storageState);
 
     throw error;
   }
@@ -188,10 +262,8 @@ export async function reserveManagedStorageBytes({
       }
 
       released = true;
-      reservationRegistry.delete(reservationId);
-      if (reservationRegistry.size === 0) {
-        storageReservations.delete(storageRoot);
-      }
+      storageState.reservationRegistry.delete(reservationId);
+      cleanupStorageStateIfUnused(storageRoot, storageState);
     },
   };
 }
