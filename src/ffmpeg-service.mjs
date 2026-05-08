@@ -63,6 +63,8 @@ const DEFAULT_FPS = 30;
 const DEFAULT_CRF = 18;
 const DEFAULT_VIDEO_CODEC = 'libx264';
 const DEFAULT_ENCODE_PRESET = 'medium';
+const LONG_RENDER_ENCODE_PRESET = 'veryfast';
+const LONG_RENDER_THRESHOLD_SECONDS = 20;
 const DEFAULT_AUDIO_CODEC = 'aac';
 const DEFAULT_AUDIO_BITRATE = '192k';
 const DEFAULT_AUDIO_SAMPLE_RATE = 48000;
@@ -633,10 +635,15 @@ function buildBellEnvelopeExpression(progressExpression) {
 function buildProgressExpressions(totalFrames) {
   const lastFrameIndex = Math.max(totalFrames - 1, 1);
   const progress = `on/${lastFrameIndex}`;
+  const smootherStep = buildSmootherStepExpression(progress);
 
+  // Blend 50% smootherstep + 50% linear to guarantee non-zero velocity at
+  // boundaries.  Pure smootherstep has zero derivative at t=0 and t=1 which
+  // causes pixel-quantization jitter in zoompan (integer x/y truncation)
+  // when the per-frame position delta drops below 1 source pixel.
   return {
     progress,
-    easedProgress: buildSmootherStepExpression(progress),
+    easedProgress: `(0.5*(${smootherStep})+0.5*(${progress}))`,
   };
 }
 
@@ -1172,8 +1179,9 @@ export function getAdaptiveEncodePreset(requestedPreset, durationSeconds) {
     return normalizeEncodePreset(requestedPreset);
   }
 
-  void durationSeconds;
-  return DEFAULT_ENCODE_PRESET;
+  return durationSeconds >= LONG_RENDER_THRESHOLD_SECONDS
+    ? LONG_RENDER_ENCODE_PRESET
+    : DEFAULT_ENCODE_PRESET;
 }
 
 function normalizeCrf(value) {
