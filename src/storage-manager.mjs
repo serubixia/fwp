@@ -47,7 +47,7 @@ export function resolveManagedStorageMaxBytes(value = process.env.FFMPEG_STORAGE
   return ensureNonNegativeInteger(value, 'FFMPEG_STORAGE_MAX_BYTES', 0);
 }
 
-export async function ensureManagedStorageRoot(storageRoot = resolveManagedStorageRoot()) {
+async function ensureManagedStorageRoot(storageRoot = resolveManagedStorageRoot()) {
   await mkdir(storageRoot, { recursive: true });
   return storageRoot;
 }
@@ -63,7 +63,7 @@ async function getPathSizeBytes(targetPath) {
   return childSizes.reduce((totalBytes, childBytes) => totalBytes + childBytes, 0);
 }
 
-export async function getManagedStorageUsageBytes(storageRoot = resolveManagedStorageRoot()) {
+async function getManagedStorageUsageBytes(storageRoot = resolveManagedStorageRoot()) {
   const childEntries = await readdir(storageRoot, { withFileTypes: true }).catch((error) => {
     if (error?.code === 'ENOENT') {
       return [];
@@ -80,7 +80,7 @@ export async function getManagedStorageUsageBytes(storageRoot = resolveManagedSt
   return managedEntrySizes.reduce((totalBytes, managedEntryBytes) => totalBytes + managedEntryBytes, 0);
 }
 
-export function createStorageQuotaExceededError({
+function createStorageQuotaExceededError({
   storageRoot,
   maxBytes,
   usageBytes,
@@ -103,45 +103,85 @@ export function createStorageQuotaExceededError({
   return error;
 }
 
-export function isStorageQuotaExceededError(error) {
-  return error?.code === 'STORAGE_QUOTA_EXCEEDED';
-}
-
 export async function reserveManagedStorageBytes({
   storageRoot = resolveManagedStorageRoot(),
   maxBytes = resolveManagedStorageMaxBytes(),
   bytes = 0,
 } = {}) {
   const requestedBytes = ensureNonNegativeInteger(bytes, 'managed storage reservation bytes', 0);
-  if (maxBytes === 0 || requestedBytes === 0) {
+  if (maxBytes === 0) {
+    let currentBytes = requestedBytes;
+    let currentUsageBytes = 0;
+
     return {
       storageRoot,
-      bytes: requestedBytes,
+      get bytes() {
+        return currentBytes;
+      },
+      get usageBytes() {
+        return currentUsageBytes;
+      },
+      async setBytes(nextBytes) {
+        currentBytes = ensureNonNegativeInteger(nextBytes, 'managed storage reservation bytes', 0);
+      },
       release() {},
     };
   }
 
   await ensureManagedStorageRoot(storageRoot);
-  const usageBytes = await getManagedStorageUsageBytes(storageRoot);
-  const reservedBytes = getReservedBytes(storageRoot);
-  if (usageBytes + reservedBytes + requestedBytes > maxBytes) {
-    throw createStorageQuotaExceededError({
-      storageRoot,
-      maxBytes,
-      usageBytes,
-      reservedBytes,
-      requestedBytes,
-    });
-  }
-
+  const initialUsageBytes = await getManagedStorageUsageBytes(storageRoot);
   const reservationRegistry = getReservationRegistry(storageRoot);
   const reservationId = randomUUID();
   let released = false;
-  reservationRegistry.set(reservationId, requestedBytes);
+  let currentBytes = 0;
+  let currentUsageBytes = initialUsageBytes;
+  reservationRegistry.set(reservationId, currentBytes);
+
+  async function setBytes(nextBytes, { usageBytes } = {}) {
+    const targetBytes = ensureNonNegativeInteger(nextBytes, 'managed storage reservation bytes', 0);
+    if (released) {
+      throw new Error('Managed storage reservation was already released.');
+    }
+
+    const effectiveUsageBytes = usageBytes == null
+      ? await getManagedStorageUsageBytes(storageRoot)
+      : ensureNonNegativeInteger(usageBytes, 'managed storage usage bytes', 0);
+    const reservedBytes = Math.max(0, getReservedBytes(storageRoot) - currentBytes);
+    if (effectiveUsageBytes + reservedBytes + targetBytes > maxBytes) {
+      throw createStorageQuotaExceededError({
+        storageRoot,
+        maxBytes,
+        usageBytes: effectiveUsageBytes,
+        reservedBytes,
+        requestedBytes: targetBytes,
+      });
+    }
+
+    currentUsageBytes = effectiveUsageBytes;
+    currentBytes = targetBytes;
+    reservationRegistry.set(reservationId, currentBytes);
+  }
+
+  try {
+    await setBytes(requestedBytes, { usageBytes: initialUsageBytes });
+  } catch (error) {
+    reservationRegistry.delete(reservationId);
+    if (reservationRegistry.size === 0) {
+      storageReservations.delete(storageRoot);
+    }
+
+    throw error;
+  }
 
   return {
     storageRoot,
-    bytes: requestedBytes,
+    get bytes() {
+      return currentBytes;
+    },
+    get usageBytes() {
+      return currentUsageBytes;
+    },
+    setBytes,
     release() {
       if (released) {
         return;
