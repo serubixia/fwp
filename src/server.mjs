@@ -41,6 +41,7 @@ const DEFAULT_ASYNC_JOB_SWEEP_INTERVAL_MS = 60 * 1000;
 const DEFAULT_ASYNC_JOB_MAX_CONCURRENCY = 1;
 const DEFAULT_ASYNC_JOB_MAX_QUEUE = 8;
 const DEFAULT_READINESS_CACHE_TTL_MS = 30 * 1000;
+const DEFAULT_SHUTDOWN_GRACE_MS = 10 * 1000;
 const ASYNC_JOB_RESULT_DIR_PREFIX = 'ffmpeg-api-job-result-';
 const MULTIPART_UPLOAD_DIR_PREFIX = 'ffmpeg-api-upload-';
 const GENERATE_CLIP_JOB_PATH_PATTERN = /^\/v1\/render\/jobs\/([^/]+?)(?:\/(download))?$/;
@@ -71,6 +72,14 @@ function resolveNonNegativeIntegerOption(value, optionName, fallback) {
   }
 
   return parsedValue;
+}
+
+function resolveShutdownGraceMs(value = process.env.SHUTDOWN_GRACE_MS) {
+  return resolveNonNegativeIntegerOption(value, 'SHUTDOWN_GRACE_MS', DEFAULT_SHUTDOWN_GRACE_MS);
+}
+
+function canWriteResponse(response) {
+  return !response.destroyed && !response.writableEnded && !response.headersSent;
 }
 
 function sendJson(response, statusCode, payload, extraHeaders = {}) {
@@ -1135,10 +1144,13 @@ async function readMultipartFormData(request, url, maxBodyBytes, {
       storageReservation.release();
     }
 
-    function teardown() {
+    function teardownRequest() {
       request.off('data', onData);
       request.off('error', onRequestError);
       request.off('aborted', onRequestAborted);
+    }
+
+    function teardownBusboy() {
       busboy.off('error', onBusboyError);
       busboy.off('finish', onBusboyFinish);
     }
@@ -1149,9 +1161,9 @@ async function readMultipartFormData(request, url, maxBodyBytes, {
       }
 
       settled = true;
-      teardown();
+      teardownRequest();
       request.unpipe(busboy);
-      busboy.destroy(error);
+      busboy.destroy();
       request.resume();
       void cleanupTempDir().finally(() => {
         reject(error);
@@ -1189,7 +1201,8 @@ async function readMultipartFormData(request, url, maxBodyBytes, {
           }
 
           settled = true;
-          teardown();
+                    teardownRequest();
+                    teardownBusboy();
           resolve({
             get(fieldName) {
               if (fileFields.has(fieldName)) {
@@ -1231,6 +1244,10 @@ async function readMultipartFormData(request, url, maxBodyBytes, {
 
       fileStream.on('data', (chunk) => {
         sizeBytes += chunk.length;
+      });
+
+      fileStream.on('error', (error) => {
+        rejectOnce(new Error(`Invalid multipart/form-data body: ${error.message}`));
       });
 
       const writePromise = pipeline(fileStream, createWriteStream(filePath))
@@ -1801,11 +1818,22 @@ export function createServer({
         logError('http.request.failed', {
           error: error.message,
         });
-        sendJson(response, error.statusCode ?? (isAsyncJobQueueFullError(error) ? 429 : 400), {
-          ok: false,
-          error: error.message,
-          ...(error.details ?? null),
-        });
+
+        if (!canWriteResponse(response)) {
+          return;
+        }
+
+        try {
+          sendJson(response, error.statusCode ?? (isAsyncJobQueueFullError(error) ? 429 : 400), {
+            ok: false,
+            error: error.message,
+            ...(error.details ?? null),
+          });
+        } catch (responseError) {
+          logWarn('http.response.write_failed', {
+            error: responseError.message,
+          });
+        }
       }
     });
   });
@@ -1823,8 +1851,82 @@ export function createServer({
 
 const modulePath = fileURLToPath(import.meta.url);
 
+function closeHttpServer(server) {
+  return new Promise((resolve, reject) => {
+    server.close((error) => {
+      if (error) {
+        reject(error);
+        return;
+      }
+
+      resolve();
+    });
+  });
+}
+
+function closeIdleHttpConnections(server) {
+  server.closeIdleConnections?.();
+}
+
+function closeAllHttpConnections(server) {
+  closeIdleHttpConnections(server);
+  server.closeAllConnections?.();
+}
+
+function installSignalHandlers(server, { shutdownGraceMs = process.env.SHUTDOWN_GRACE_MS } = {}) {
+  let shutdownRequested = false;
+  const effectiveShutdownGraceMs = resolveShutdownGraceMs(shutdownGraceMs);
+
+  async function handleSignal(signal) {
+    if (shutdownRequested) {
+      return;
+    }
+
+    shutdownRequested = true;
+    logInfo('server.shutdown.requested', {
+      signal,
+      shutdown_grace_ms: effectiveShutdownGraceMs,
+    });
+
+    closeIdleHttpConnections(server);
+
+    const shutdownDeadlineTimer = setTimeout(() => {
+      logWarn('server.shutdown.deadline_exceeded', {
+        signal,
+        shutdown_grace_ms: effectiveShutdownGraceMs,
+      });
+      closeAllHttpConnections(server);
+    }, effectiveShutdownGraceMs);
+    shutdownDeadlineTimer.unref?.();
+
+    try {
+      await closeHttpServer(server);
+      clearTimeout(shutdownDeadlineTimer);
+      logInfo('server.shutdown.completed', {
+        signal,
+        shutdown_grace_ms: effectiveShutdownGraceMs,
+      });
+    } catch (error) {
+      clearTimeout(shutdownDeadlineTimer);
+      process.exitCode = 1;
+      logError('server.shutdown.failed', {
+        signal,
+        error: error.message,
+      });
+    }
+  }
+
+  process.on('SIGTERM', () => {
+    void handleSignal('SIGTERM');
+  });
+  process.on('SIGINT', () => {
+    void handleSignal('SIGINT');
+  });
+}
+
 if (process.argv[1] && path.resolve(process.argv[1]) === modulePath) {
   const server = createServer();
+  installSignalHandlers(server);
   server.listen(PORT, () => {
     logInfo('server.started', {
       port: PORT,
