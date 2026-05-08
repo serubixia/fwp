@@ -99,10 +99,6 @@ function formatNumber(value, digits = 6) {
   return Number(value.toFixed(digits)).toString();
 }
 
-function snapToFrameBoundary(seconds, fps) {
-  return Math.round(seconds * fps) / fps;
-}
-
 function normalizePositiveInteger(value, fallback, label) {
   const numericValue = value == null ? fallback : Number(value);
   if (!Number.isInteger(numericValue) || numericValue <= 0) {
@@ -1032,19 +1028,18 @@ export function buildJoinClipsFilterGraph({
   }
 
   let currentLabel = 'v0';
-  let cumulativeDuration = snapToFrameBoundary(normalizedDurations[0], normalizedFps);
+  let cumulativeDuration = normalizedDurations[0];
 
   for (let index = 1; index < normalizedClips.length; index += 1) {
     const transition = normalizedClips[index - 1].transition_to_next;
     const nextLabel = index === normalizedClips.length - 1 ? 'vout' : `vx${index}`;
-    const snappedTransitionDuration = snapToFrameBoundary(transition.duration_seconds, normalizedFps);
-    const offsetSeconds = snapToFrameBoundary(cumulativeDuration - snappedTransitionDuration, normalizedFps);
+    const offsetSeconds = cumulativeDuration - transition.duration_seconds;
 
     filterParts.push(
-      `[${currentLabel}][v${index}]xfade=transition=${XFADE_TRANSITIONS[transition.preset]}:duration=${formatNumber(snappedTransitionDuration, 3)}:offset=${formatNumber(offsetSeconds, 3)}[${nextLabel}]`
+      `[${currentLabel}][v${index}]xfade=transition=${XFADE_TRANSITIONS[transition.preset]}:duration=${formatNumber(transition.duration_seconds, 3)}:offset=${formatNumber(offsetSeconds, 3)}[${nextLabel}]`
     );
 
-    cumulativeDuration = snapToFrameBoundary(cumulativeDuration + normalizedDurations[index] - snappedTransitionDuration, normalizedFps);
+    cumulativeDuration += normalizedDurations[index] - transition.duration_seconds;
     currentLabel = nextLabel;
   }
 
