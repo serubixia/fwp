@@ -2,7 +2,6 @@ import { randomUUID } from 'node:crypto';
 import { createReadStream, createWriteStream } from 'node:fs';
 import { mkdtemp, rm, stat, writeFile } from 'node:fs/promises';
 import http from 'node:http';
-import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { pipeline } from 'node:stream/promises';
 import { fileURLToPath } from 'node:url';
@@ -25,14 +24,12 @@ import {
   runWithLogContext,
 } from './logger.mjs';
 import {
-  isStorageQuotaExceededError,
   reserveManagedStorageBytes,
   resolveManagedStorageMaxBytes,
   resolveManagedStorageRoot,
 } from './storage-manager.mjs';
 
 const PORT = Number(process.env.PORT || 3000);
-const MAX_JSON_BODY_BYTES = 1024 * 1024;
 const MAX_GENERATE_CLIP_BODY_BYTES = 64 * 1024 * 1024;
 const DEFAULT_MAX_JOIN_CLIPS_BODY_BYTES = 256 * 1024 * 1024;
 const MAX_PROBE_AUDIO_BODY_BYTES = 64 * 1024 * 1024;
@@ -90,15 +87,6 @@ function sendJson(response, statusCode, payload, extraHeaders = {}) {
   response.end(`${JSON.stringify(payload, null, 2)}\n`);
 }
 
-function sendBinary(response, statusCode, body, contentType, extraHeaders = {}) {
-  response.writeHead(statusCode, {
-    'content-type': contentType,
-    'content-length': String(body.length),
-    ...extraHeaders,
-  });
-  response.end(body);
-}
-
 async function sendBinaryFile(response, statusCode, filePath, contentType, extraHeaders = {}) {
   const fileStats = await stat(filePath);
 
@@ -130,15 +118,82 @@ function summarizeBinaryField(upload) {
 function sanitizeResult(result) {
   return result == null
     ? null
-    : Object.fromEntries(Object.entries(result).filter(([key]) => key !== 'buffer'));
+    : Object.fromEntries(Object.entries(result).filter(([key]) => !['buffer', 'file_path', 'temp_dir'].includes(key)));
 }
 
 function resolveAsyncJobStorageRoot(value) {
   return resolveManagedStorageRoot(value);
 }
 
+function resolveResultOwnedPath(value, label) {
+  if (value == null) {
+    return null;
+  }
+
+  if (typeof value !== 'string' || value.trim().length === 0) {
+    throw new Error(`${label} must be a non-empty string.`);
+  }
+
+  return path.resolve(value.trim());
+}
+
+function isPathInsideDirectory(targetPath, directoryPath) {
+  const relativePath = path.relative(directoryPath, targetPath);
+
+  return relativePath === '' || (!relativePath.startsWith('..') && !path.isAbsolute(relativePath));
+}
+
 async function persistJobResult(result, { jobId, jobType, storageRoot, storageMaxBytes }) {
-  if (result == null || result.buffer == null) {
+  if (result == null) {
+    return {
+      result: null,
+      file_path: null,
+      temp_dir: null,
+    };
+  }
+
+  const stagedFilePath = resolveResultOwnedPath(result.file_path, 'result.file_path');
+  const stagedTempDir = resolveResultOwnedPath(result.temp_dir, 'result.temp_dir');
+
+  if (stagedFilePath != null) {
+    if (stagedTempDir != null && !isPathInsideDirectory(stagedFilePath, stagedTempDir)) {
+      throw new Error('result.file_path must stay inside result.temp_dir.');
+    }
+
+    const sourceStats = await stat(stagedFilePath);
+    if (!sourceStats.isFile()) {
+      throw new Error('result.file_path must point to a file.');
+    }
+
+    const storageReservation = await reserveManagedStorageBytes({
+      storageRoot,
+      maxBytes: storageMaxBytes,
+      bytes: sourceStats.size,
+    });
+    const tempDir = await mkdtemp(path.join(storageRoot, ASYNC_JOB_RESULT_DIR_PREFIX));
+    const filename = path.basename(String(result.filename || path.basename(stagedFilePath) || `${jobType}-${jobId}.bin`));
+    const filePath = path.join(tempDir, filename);
+
+    try {
+      await pipeline(createReadStream(stagedFilePath), createWriteStream(filePath));
+      if (stagedTempDir != null) {
+        await rm(stagedTempDir, { recursive: true, force: true });
+      }
+
+      return {
+        result: sanitizeResult(result),
+        file_path: filePath,
+        temp_dir: tempDir,
+      };
+    } catch (error) {
+      await rm(tempDir, { recursive: true, force: true });
+      throw error;
+    } finally {
+      storageReservation.release();
+    }
+  }
+
+  if (result.buffer == null) {
     return {
       result: sanitizeResult(result),
       file_path: null,
@@ -925,7 +980,7 @@ function createAsyncBinaryJobStore({
   };
 }
 
-export function createGenerateClipJobStore({ generateClipHandler = generateClip, ...options } = {}) {
+function createGenerateClipJobStore({ generateClipHandler = generateClip, ...options } = {}) {
   return createAsyncBinaryJobStore({
     ...options,
     jobType: 'generate_clip',
@@ -934,76 +989,13 @@ export function createGenerateClipJobStore({ generateClipHandler = generateClip,
   });
 }
 
-export function createJoinClipsJobStore({ joinVideoClipsHandler = joinVideoClips, ...options } = {}) {
+function createJoinClipsJobStore({ joinVideoClipsHandler = joinVideoClips, ...options } = {}) {
   return createAsyncBinaryJobStore({
     ...options,
     jobType: 'join_video_clips',
     handler: joinVideoClipsHandler,
     summarizePayload: summarizeJoinClipsPayload,
   });
-}
-
-function readBodyBuffer(request, maxBodyBytes) {
-  return new Promise((resolve, reject) => {
-    const declaredContentLength = getDeclaredContentLength(request);
-    if (declaredContentLength != null && declaredContentLength > maxBodyBytes) {
-      reject(new Error(`Request body exceeds the ${maxBodyBytes} byte limit.`));
-      return;
-    }
-
-    const chunks = [];
-    let totalBytes = 0;
-    let settled = false;
-
-    function rejectOnce(error) {
-      if (settled) {
-        return;
-      }
-
-      settled = true;
-      reject(error);
-    }
-
-    request.on('data', (chunk) => {
-      if (settled) {
-        return;
-      }
-
-      totalBytes += chunk.length;
-      if (totalBytes > maxBodyBytes) {
-        rejectOnce(new Error(`Request body exceeds the ${maxBodyBytes} byte limit.`));
-        return;
-      }
-
-      chunks.push(chunk);
-    });
-
-    request.on('end', () => {
-      if (settled) {
-        return;
-      }
-
-      settled = true;
-      resolve(Buffer.concat(chunks));
-    });
-
-    request.on('error', rejectOnce);
-  });
-}
-
-async function readJsonBody(request, maxBodyBytes = MAX_JSON_BODY_BYTES) {
-  const bodyBuffer = await readBodyBuffer(request, maxBodyBytes);
-  const body = bodyBuffer.toString('utf8');
-
-  if (!body.trim()) {
-    return {};
-  }
-
-  try {
-    return JSON.parse(body);
-  } catch (error) {
-    throw new Error(`Invalid JSON body: ${error.message}`);
-  }
 }
 
 function readFormTextField(formData, fieldName, { required = false } = {}) {
@@ -1114,12 +1106,21 @@ async function readMultipartFormData(request, url, maxBodyBytes, {
 
   const effectiveStorageRoot = resolveAsyncJobStorageRoot(storageRoot);
   const effectiveStorageMaxBytes = resolveManagedStorageMaxBytes(storageMaxBytes);
-  const storageReservation = await reserveManagedStorageBytes({
-    storageRoot: effectiveStorageRoot,
-    maxBytes: effectiveStorageMaxBytes,
-    bytes: declaredContentLength ?? maxBodyBytes,
-  });
+  const storageReservation = declaredContentLength == null
+    ? null
+    : await reserveManagedStorageBytes({
+      storageRoot: effectiveStorageRoot,
+      maxBytes: effectiveStorageMaxBytes,
+      bytes: declaredContentLength,
+    });
   const tempDir = await mkdtemp(path.join(effectiveStorageRoot, MULTIPART_UPLOAD_DIR_PREFIX));
+  const dynamicStorageReservation = declaredContentLength == null
+    ? await reserveManagedStorageBytes({
+      storageRoot: effectiveStorageRoot,
+      maxBytes: effectiveStorageMaxBytes,
+      bytes: 0,
+    })
+    : null;
   const textFields = new Map();
   const fileFields = new Map();
   const fileWritePromises = new Set();
@@ -1129,7 +1130,8 @@ async function readMultipartFormData(request, url, maxBodyBytes, {
     busboy = Busboy({ headers: request.headers });
   } catch (error) {
     await rm(tempDir, { recursive: true, force: true });
-    storageReservation.release();
+    dynamicStorageReservation?.release();
+    storageReservation?.release();
     throw new Error(`Invalid multipart/form-data body: ${error.message}`);
   }
 
@@ -1137,11 +1139,73 @@ async function readMultipartFormData(request, url, maxBodyBytes, {
     let settled = false;
     let totalBytes = 0;
     let fileIndex = 0;
+    let observedMultipartFileBytes = 0;
+    let persistedMultipartFileBytes = 0;
+    const activeFileWriters = new Set();
+    const dynamicStorageBaselineUsageBytes = dynamicStorageReservation?.usageBytes ?? 0;
+    let dynamicStorageSyncRequested = false;
+    let dynamicStorageSyncInFlight = false;
+    let dynamicStorageSyncPromise = Promise.resolve();
+
+    function refreshWriterProgress(writerState) {
+      const writtenBytes = writerState.writeStream.bytesWritten;
+      if (writtenBytes <= writerState.lastBytesWritten) {
+        return;
+      }
+
+      persistedMultipartFileBytes += writtenBytes - writerState.lastBytesWritten;
+      writerState.lastBytesWritten = writtenBytes;
+    }
+
+    function refreshAllWriterProgress() {
+      for (const writerState of activeFileWriters) {
+        refreshWriterProgress(writerState);
+      }
+    }
+
+    function getPendingMultipartBytes() {
+      return Math.max(0, observedMultipartFileBytes - persistedMultipartFileBytes);
+    }
+
+    function syncChunkStorageCapacity() {
+      if (dynamicStorageReservation == null) {
+        return Promise.resolve();
+      }
+
+      dynamicStorageSyncRequested = true;
+      if (dynamicStorageSyncInFlight) {
+        return dynamicStorageSyncPromise;
+      }
+
+      dynamicStorageSyncPromise = (async () => {
+        dynamicStorageSyncInFlight = true;
+
+        try {
+          while (dynamicStorageSyncRequested) {
+            dynamicStorageSyncRequested = false;
+            refreshAllWriterProgress();
+
+            await dynamicStorageReservation.setBytes(getPendingMultipartBytes(), {
+              usageBytes: dynamicStorageBaselineUsageBytes + persistedMultipartFileBytes,
+            });
+          }
+        } catch (error) {
+          rejectOnce(error);
+          throw error;
+        } finally {
+          dynamicStorageSyncInFlight = false;
+        }
+      })();
+      void dynamicStorageSyncPromise.catch(() => {});
+      return dynamicStorageSyncPromise;
+    }
 
     async function cleanupTempDir() {
       await Promise.allSettled([...fileWritePromises]);
+      await Promise.allSettled([dynamicStorageSyncPromise]);
       await rm(tempDir, { recursive: true, force: true });
-      storageReservation.release();
+      dynamicStorageReservation?.release();
+      storageReservation?.release();
     }
 
     function teardownRequest() {
@@ -1174,6 +1238,7 @@ async function readMultipartFormData(request, url, maxBodyBytes, {
       totalBytes += chunk.length;
       if (totalBytes > maxBodyBytes) {
         rejectOnce(new Error(`Request body exceeds the ${maxBodyBytes} byte limit.`));
+        return;
       }
     }
 
@@ -1195,14 +1260,16 @@ async function readMultipartFormData(request, url, maxBodyBytes, {
       }
 
       void Promise.all([...fileWritePromises])
+        .then(() => syncChunkStorageCapacity())
+        .then(() => dynamicStorageSyncPromise)
         .then(() => {
           if (settled) {
             return;
           }
 
           settled = true;
-                    teardownRequest();
-                    teardownBusboy();
+          teardownRequest();
+          teardownBusboy();
           resolve({
             get(fieldName) {
               if (fileFields.has(fieldName)) {
@@ -1240,20 +1307,34 @@ async function readMultipartFormData(request, url, maxBodyBytes, {
         tempDir,
         `${String(fileIndex).padStart(2, '0')}-${sanitizeMultipartPathSegment(fieldName, 'field')}-${sanitizeMultipartPathSegment(baseName, 'upload')}${extension}`
       );
+      const writeStream = createWriteStream(filePath);
+      const writerState = {
+        writeStream,
+        lastBytesWritten: 0,
+      };
       let sizeBytes = 0;
+
+      activeFileWriters.add(writerState);
 
       fileStream.on('data', (chunk) => {
         sizeBytes += chunk.length;
+        observedMultipartFileBytes += chunk.length;
+        void syncChunkStorageCapacity();
       });
 
       fileStream.on('error', (error) => {
         rejectOnce(new Error(`Invalid multipart/form-data body: ${error.message}`));
       });
 
-      const writePromise = pipeline(fileStream, createWriteStream(filePath))
+      const writePromise = pipeline(fileStream, writeStream)
         .then(async () => {
+          refreshWriterProgress(writerState);
+          activeFileWriters.delete(writerState);
+
           if (fileFields.has(fieldName)) {
             await rm(filePath, { force: true });
+            persistedMultipartFileBytes = Math.max(0, persistedMultipartFileBytes - sizeBytes);
+            void syncChunkStorageCapacity();
             return;
           }
 
@@ -1266,7 +1347,10 @@ async function readMultipartFormData(request, url, maxBodyBytes, {
           rejectOnce(new Error(`Invalid multipart/form-data body: ${error.message}`));
         })
         .finally(() => {
+          refreshWriterProgress(writerState);
+          activeFileWriters.delete(writerState);
           fileWritePromises.delete(writePromise);
+          void syncChunkStorageCapacity();
         });
     });
 
