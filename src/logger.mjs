@@ -65,10 +65,6 @@ export function setLogWriter(writer) {
   };
 }
 
-export function logDebug(event, payload) {
-  writeLog('debug', event, payload);
-}
-
 export function logInfo(event, payload) {
   writeLog('info', event, payload);
 }
