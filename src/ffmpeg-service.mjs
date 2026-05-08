@@ -1,9 +1,17 @@
 import { spawn } from 'node:child_process';
+import { createWriteStream } from 'node:fs';
 import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
+import { Readable } from 'node:stream';
+import { pipeline } from 'node:stream/promises';
 
-import { logError, logInfo } from './logger.mjs';
+import { getLogContext, logError, logInfo, logWarn } from './logger.mjs';
+import {
+  reserveManagedStorageBytes,
+  resolveManagedStorageMaxBytes,
+  resolveManagedStorageRoot,
+} from './storage-manager.mjs';
 
 export const SCENE_IMAGE_MOTION_PRESETS = Object.freeze([
   'static_hold',
@@ -66,6 +74,9 @@ const DEFAULT_BORDER_COLOR = 'black@0.45';
 const GENERATE_CLIP_UPLOAD_DIR_PREFIX = 'ffmpeg-api-generate-clip-';
 const JOIN_CLIPS_UPLOAD_DIR_PREFIX = 'ffmpeg-api-join-clips-';
 const PROBE_AUDIO_UPLOAD_DIR_PREFIX = 'ffmpeg-api-probe-audio-';
+const ACTIVE_JOB_PROCESS_KILL_GRACE_MS = 1000;
+const DEFAULT_FFMPEG_COMMAND_TIMEOUT_MS = 30 * 60 * 1000;
+const DEFAULT_FFPROBE_COMMAND_TIMEOUT_MS = 30 * 1000;
 const WAV_MIME_TYPES = Object.freeze(['audio/wav', 'audio/x-wav']);
 const MIME_TYPE_EXTENSIONS = Object.freeze({
   'image/png': '.png',
@@ -82,9 +93,14 @@ const MIME_TYPE_EXTENSIONS = Object.freeze({
   'video/webm': '.webm',
   'video/x-matroska': '.mkv',
 });
+const activeJobProcesses = new Map();
 
 function formatNumber(value, digits = 6) {
   return Number(value.toFixed(digits)).toString();
+}
+
+function snapToFrameBoundary(seconds, fps) {
+  return Math.round(seconds * fps) / fps;
 }
 
 function normalizePositiveInteger(value, fallback, label) {
@@ -158,22 +174,286 @@ function escapeExpression(value) {
   return String(value).replace(/,/g, '\\,');
 }
 
-async function runCommand(binary, args) {
+function createProcessCancellationError(binary, reason, signal) {
+  const error = new Error(reason == null
+    ? `${binary} was cancelled.`
+    : `${binary} was cancelled: ${reason}`);
+
+  error.name = 'ProcessCancelledError';
+  error.code = 'PROCESS_CANCELLED';
+  error.cancel_reason = reason ?? null;
+  error.signal = signal ?? null;
+  return error;
+}
+
+export function isProcessCancellationError(error) {
+  return error?.code === 'PROCESS_CANCELLED';
+}
+
+function createProcessTimeoutError(binary, timeoutMs, signal) {
+  const error = new Error(`${binary} timed out after ${timeoutMs}ms.`);
+
+  error.name = 'ProcessTimeoutError';
+  error.code = 'PROCESS_TIMEOUT';
+  error.timeout_ms = timeoutMs;
+  error.signal = signal ?? null;
+  return error;
+}
+
+export function isProcessTimeoutError(error) {
+  return error?.code === 'PROCESS_TIMEOUT';
+}
+
+function resolveCommandTimeoutMs(binary, timeoutMs) {
+  if (timeoutMs != null) {
+    return normalizeNonNegativeNumber(timeoutMs, 0, `${binary} timeout_ms`);
+  }
+
+  const binaryName = path.basename(binary);
+  if (binaryName === 'ffmpeg') {
+    return normalizeNonNegativeNumber(
+      process.env.FFMPEG_COMMAND_TIMEOUT_MS,
+      DEFAULT_FFMPEG_COMMAND_TIMEOUT_MS,
+      'FFMPEG_COMMAND_TIMEOUT_MS'
+    );
+  }
+
+  if (binaryName === 'ffprobe') {
+    return normalizeNonNegativeNumber(
+      process.env.FFPROBE_COMMAND_TIMEOUT_MS,
+      DEFAULT_FFPROBE_COMMAND_TIMEOUT_MS,
+      'FFPROBE_COMMAND_TIMEOUT_MS'
+    );
+  }
+
+  return 0;
+}
+
+function getActiveJobProcessSet(jobId) {
+  const existingSet = activeJobProcesses.get(jobId);
+  if (existingSet != null) {
+    return existingSet;
+  }
+
+  const processSet = new Set();
+  activeJobProcesses.set(jobId, processSet);
+  return processSet;
+}
+
+function registerActiveJobProcess(jobId, processInfo) {
+  if (typeof jobId !== 'string' || jobId.trim().length === 0) {
+    return;
+  }
+
+  getActiveJobProcessSet(jobId).add(processInfo);
+}
+
+function unregisterActiveJobProcess(jobId, processInfo) {
+  if (typeof jobId !== 'string' || jobId.trim().length === 0) {
+    return;
+  }
+
+  const processSet = activeJobProcesses.get(jobId);
+  if (processSet == null) {
+    return;
+  }
+
+  processSet.delete(processInfo);
+  if (processSet.size === 0) {
+    activeJobProcesses.delete(jobId);
+  }
+}
+
+function clearProcessKillTimer(processInfo) {
+  if (processInfo.kill_timer != null) {
+    clearTimeout(processInfo.kill_timer);
+    processInfo.kill_timer = null;
+  }
+}
+
+function clearProcessTimeoutTimer(processInfo) {
+  if (processInfo.timeout_timer != null) {
+    clearTimeout(processInfo.timeout_timer);
+    processInfo.timeout_timer = null;
+  }
+}
+
+function requestProcessTermination(processInfo, {
+  kind,
+  reason,
+  timeoutMs = null,
+  eventName,
+} = {}) {
+  if (
+    processInfo == null
+    || processInfo.exited
+    || processInfo.cancel_requested
+    || processInfo.timeout_requested
+  ) {
+    return false;
+  }
+
+  processInfo.cancel_requested = kind === 'cancel';
+  processInfo.cancel_reason = kind === 'cancel' ? reason : null;
+  processInfo.timeout_requested = kind === 'timeout';
+  processInfo.timeout_ms = kind === 'timeout' ? timeoutMs : null;
+  clearProcessTimeoutTimer(processInfo);
+
+  let signalAccepted = false;
+  try {
+    signalAccepted = processInfo.child.kill('SIGTERM');
+  } catch (error) {
+    processInfo.cancel_requested = false;
+    processInfo.cancel_reason = null;
+    processInfo.timeout_requested = false;
+    processInfo.timeout_ms = null;
+    logError('process.command.cancel_request_failed', {
+      binary: processInfo.binary,
+      job_id: processInfo.job_id,
+      error: error.message,
+    });
+    return false;
+  }
+
+  if (!signalAccepted) {
+    processInfo.cancel_requested = false;
+    processInfo.cancel_reason = null;
+    processInfo.timeout_requested = false;
+    processInfo.timeout_ms = null;
+    return false;
+  }
+
+  logWarn(eventName, {
+    binary: processInfo.binary,
+    job_id: processInfo.job_id,
+    reason: kind === 'cancel' ? reason : undefined,
+    timeout_ms: kind === 'timeout' ? timeoutMs : undefined,
+  });
+
+  processInfo.kill_timer = setTimeout(() => {
+    if (processInfo.exited) {
+      return;
+    }
+
+    try {
+      processInfo.child.kill('SIGKILL');
+    } catch {
+      return;
+    }
+  }, ACTIVE_JOB_PROCESS_KILL_GRACE_MS);
+  processInfo.kill_timer.unref?.();
+  return true;
+}
+
+function requestProcessCancellation(processInfo, reason) {
+  return requestProcessTermination(processInfo, {
+    kind: 'cancel',
+    reason,
+    eventName: 'process.command.cancel_requested',
+  });
+}
+
+function requestProcessTimeout(processInfo, timeoutMs) {
+  return requestProcessTermination(processInfo, {
+    kind: 'timeout',
+    timeoutMs,
+    eventName: 'process.command.timeout_requested',
+  });
+}
+
+export function cancelActiveJobProcesses(jobId, reason = 'Job cancelled.') {
+  if (typeof jobId !== 'string' || jobId.trim().length === 0) {
+    return 0;
+  }
+
+  const processSet = activeJobProcesses.get(jobId);
+  if (processSet == null || processSet.size === 0) {
+    return 0;
+  }
+
+  let cancelledCount = 0;
+  for (const processInfo of processSet) {
+    if (requestProcessCancellation(processInfo, reason)) {
+      cancelledCount += 1;
+    }
+  }
+
+  return cancelledCount;
+}
+
+export async function runCommand(binary, args, { timeoutMs } = {}) {
   const startedAt = Date.now();
   const commandPreview = `${binary} ${args.join(' ')}`;
+  const logContext = getLogContext();
+  const jobId = typeof logContext.job_id === 'string' ? logContext.job_id : null;
+  const effectiveTimeoutMs = resolveCommandTimeoutMs(binary, timeoutMs);
 
   logInfo('process.command.started', {
     binary,
     command: commandPreview.length > 1200 ? `${commandPreview.slice(0, 1197)}...` : commandPreview,
+    timeout_ms: effectiveTimeoutMs > 0 ? effectiveTimeoutMs : undefined,
   });
 
   return new Promise((resolve, reject) => {
+    let settled = false;
     const child = spawn(binary, args, {
       stdio: ['ignore', 'pipe', 'pipe'],
     });
+    const processInfo = {
+      binary,
+      child,
+      job_id: jobId,
+      cancel_requested: false,
+      cancel_reason: null,
+      timeout_requested: false,
+      timeout_ms: null,
+      exited: false,
+      kill_timer: null,
+      timeout_timer: null,
+    };
+
+    registerActiveJobProcess(jobId, processInfo);
 
     let stdout = '';
     let stderr = '';
+
+    function finalize() {
+      if (processInfo.exited) {
+        return;
+      }
+
+      processInfo.exited = true;
+      clearProcessKillTimer(processInfo);
+      clearProcessTimeoutTimer(processInfo);
+      unregisterActiveJobProcess(jobId, processInfo);
+    }
+
+    if (effectiveTimeoutMs > 0) {
+      processInfo.timeout_timer = setTimeout(() => {
+        requestProcessTimeout(processInfo, effectiveTimeoutMs);
+      }, effectiveTimeoutMs);
+      processInfo.timeout_timer.unref?.();
+    }
+
+    function resolveOnce(value) {
+      if (settled) {
+        return;
+      }
+
+      settled = true;
+      finalize();
+      resolve(value);
+    }
+
+    function rejectOnce(error) {
+      if (settled) {
+        return;
+      }
+
+      settled = true;
+      finalize();
+      reject(error);
+    }
 
     child.stdout.on('data', (chunk) => {
       stdout += chunk;
@@ -184,15 +464,61 @@ async function runCommand(binary, args) {
     });
 
     child.on('error', (error) => {
+      if (processInfo.cancel_requested) {
+        const cancellationError = createProcessCancellationError(binary, processInfo.cancel_reason, error.signal);
+        logWarn('process.command.cancelled', {
+          binary,
+          duration_ms: Date.now() - startedAt,
+          reason: processInfo.cancel_reason,
+        });
+        rejectOnce(cancellationError);
+        return;
+      }
+
+      if (processInfo.timeout_requested) {
+        const timeoutError = createProcessTimeoutError(binary, processInfo.timeout_ms, error.signal);
+        logWarn('process.command.timed_out', {
+          binary,
+          duration_ms: Date.now() - startedAt,
+          timeout_ms: processInfo.timeout_ms,
+        });
+        rejectOnce(timeoutError);
+        return;
+      }
+
       logError('process.command.spawn_failed', {
         binary,
         duration_ms: Date.now() - startedAt,
         error: error.message,
       });
-      reject(error);
+      rejectOnce(error);
     });
 
-    child.on('close', (code) => {
+    child.on('close', (code, signal) => {
+      if (processInfo.cancel_requested) {
+        const cancellationError = createProcessCancellationError(binary, processInfo.cancel_reason, signal);
+        logWarn('process.command.cancelled', {
+          binary,
+          duration_ms: Date.now() - startedAt,
+          reason: processInfo.cancel_reason,
+          exit_signal: signal ?? undefined,
+        });
+        rejectOnce(cancellationError);
+        return;
+      }
+
+      if (processInfo.timeout_requested) {
+        const timeoutError = createProcessTimeoutError(binary, processInfo.timeout_ms, signal);
+        logWarn('process.command.timed_out', {
+          binary,
+          duration_ms: Date.now() - startedAt,
+          timeout_ms: processInfo.timeout_ms,
+          exit_signal: signal ?? undefined,
+        });
+        rejectOnce(timeoutError);
+        return;
+      }
+
       if (code === 0) {
         logInfo('process.command.completed', {
           binary,
@@ -200,7 +526,7 @@ async function runCommand(binary, args) {
           stdout_bytes: Buffer.byteLength(stdout),
           stderr_bytes: Buffer.byteLength(stderr),
         });
-        resolve({ stdout, stderr });
+        resolveOnce({ stdout, stderr });
         return;
       }
 
@@ -208,11 +534,12 @@ async function runCommand(binary, args) {
         binary,
         duration_ms: Date.now() - startedAt,
         exit_code: code,
+        exit_signal: signal ?? undefined,
         stderr_excerpt: stderr.trim().length > 1200 ? `...${stderr.trim().slice(-1197)}` : stderr.trim() || undefined,
         stdout_excerpt: stdout.trim().length > 1200 ? `...${stdout.trim().slice(-1197)}` : stdout.trim() || undefined,
       });
 
-      reject(new Error([
+      rejectOnce(new Error([
         `${binary} exited with code ${code}.`,
         stderr.trim(),
         stdout.trim(),
@@ -705,18 +1032,19 @@ export function buildJoinClipsFilterGraph({
   }
 
   let currentLabel = 'v0';
-  let cumulativeDuration = normalizedDurations[0];
+  let cumulativeDuration = snapToFrameBoundary(normalizedDurations[0], normalizedFps);
 
   for (let index = 1; index < normalizedClips.length; index += 1) {
     const transition = normalizedClips[index - 1].transition_to_next;
     const nextLabel = index === normalizedClips.length - 1 ? 'vout' : `vx${index}`;
-    const offsetSeconds = cumulativeDuration - transition.duration_seconds;
+    const snappedTransitionDuration = snapToFrameBoundary(transition.duration_seconds, normalizedFps);
+    const offsetSeconds = snapToFrameBoundary(cumulativeDuration - snappedTransitionDuration, normalizedFps);
 
     filterParts.push(
-      `[${currentLabel}][v${index}]xfade=transition=${XFADE_TRANSITIONS[transition.preset]}:duration=${formatNumber(transition.duration_seconds, 3)}:offset=${formatNumber(offsetSeconds, 3)}[${nextLabel}]`
+      `[${currentLabel}][v${index}]xfade=transition=${XFADE_TRANSITIONS[transition.preset]}:duration=${formatNumber(snappedTransitionDuration, 3)}:offset=${formatNumber(offsetSeconds, 3)}[${nextLabel}]`
     );
 
-    cumulativeDuration += normalizedDurations[index] - transition.duration_seconds;
+    cumulativeDuration = snapToFrameBoundary(cumulativeDuration + normalizedDurations[index] - snappedTransitionDuration, normalizedFps);
     currentLabel = nextLabel;
   }
 
@@ -945,6 +1273,39 @@ function getUploadMimeType(upload, label) {
   return mimeType == null ? '' : ensureNonEmptyString(mimeType, `${label}.mime_type`);
 }
 
+function getUploadFilePath(upload, label) {
+  const filePath = upload.file_path ?? upload.filePath;
+  return filePath == null ? '' : ensureNonEmptyString(filePath, `${label}.file_path`);
+}
+
+function getUploadSizeBytes(upload) {
+  if (!upload || typeof upload !== 'object') {
+    return 0;
+  }
+
+  if (getUploadFilePath(upload, 'upload') !== '') {
+    return 0;
+  }
+
+  if (upload.file != null) {
+    return Number(upload.size_bytes ?? upload.file.size ?? 0);
+  }
+
+  if (upload.buffer != null) {
+    return normalizeBinaryBuffer(upload.buffer, 'upload.buffer').length;
+  }
+
+  const uploadBase64Field = getUploadBase64Field(upload);
+  if (uploadBase64Field != null) {
+    return Buffer.from(
+      normalizeBase64UploadValue(uploadBase64Field.value, `upload.${uploadBase64Field.field}`),
+      'base64'
+    ).length;
+  }
+
+  return 0;
+}
+
 function normalizeBase64UploadValue(value, label) {
   const rawValue = ensureNonEmptyString(value, label)
     .trim()
@@ -974,6 +1335,33 @@ function normalizeBase64UploadValue(value, label) {
 async function normalizeBinaryUpload(upload, label) {
   if (!upload || typeof upload !== 'object') {
     throw new Error(`${label} must be an object.`);
+  }
+
+  const uploadFilePath = getUploadFilePath(upload, label);
+  if (uploadFilePath) {
+    const sizeBytes = Number(upload.size_bytes ?? upload.sizeBytes ?? 0);
+    if (!Number.isFinite(sizeBytes) || sizeBytes <= 0) {
+      throw new Error(`${label} must not be empty.`);
+    }
+
+    return {
+      file_path: uploadFilePath,
+      filename: getUploadFilename(upload, label),
+      mime_type: getUploadMimeType(upload, label),
+    };
+  }
+
+  if (upload.file != null) {
+    const sizeBytes = Number(upload.size_bytes ?? upload.file.size ?? 0);
+    if (!Number.isFinite(sizeBytes) || sizeBytes <= 0) {
+      throw new Error(`${label} must not be empty.`);
+    }
+
+    return {
+      file: upload.file,
+      filename: getUploadFilename(upload, label),
+      mime_type: getUploadMimeType(upload, label),
+    };
   }
 
   if (upload.buffer != null) {
@@ -1035,9 +1423,28 @@ function assertWavUpload(upload, label) {
 
 async function writeBinaryUploadToTempFile(upload, tempDir, baseName, fallbackExtension) {
   const normalizedUpload = await normalizeBinaryUpload(upload, baseName);
+
+  if (normalizedUpload.file_path != null) {
+    return normalizedUpload.file_path;
+  }
+
   const filePath = path.join(tempDir, `${baseName}${getUploadExtension(normalizedUpload, fallbackExtension)}`);
+
+  if (normalizedUpload.file != null) {
+    await pipeline(Readable.fromWeb(normalizedUpload.file.stream()), createWriteStream(filePath));
+    return filePath;
+  }
+
   await writeFile(filePath, normalizedUpload.buffer);
   return filePath;
+}
+
+function hasBinaryUploadSource(upload) {
+  return upload?.buffer != null || upload?.file != null || upload?.file_path != null || upload?.filePath != null;
+}
+
+function hasDirectUploadFilePath(upload) {
+  return getUploadFilePath(upload ?? {}, 'upload') !== '';
 }
 
 export function getGenerateClipDurationSeconds(requestBody) {
@@ -1048,7 +1455,7 @@ export function getGenerateClipDurationSeconds(requestBody) {
   );
 }
 
-export async function materializeGenerateClipBinaryInputs(requestBody, tempRoot = tmpdir()) {
+export async function materializeGenerateClipBinaryInputs(requestBody, tempRoot = resolveManagedStorageRoot()) {
   const imageBinary = requestBody.image_binary ?? requestBody.imageBinary;
   const voiceoverBinary = requestBody.voiceover_binary ?? requestBody.voiceoverBinary;
 
@@ -1056,14 +1463,26 @@ export async function materializeGenerateClipBinaryInputs(requestBody, tempRoot 
     return null;
   }
 
-  const tempDir = await mkdtemp(path.join(tempRoot, GENERATE_CLIP_UPLOAD_DIR_PREFIX));
+  const needsTempDir = [imageBinary, voiceoverBinary].some((upload) => upload != null && !hasDirectUploadFilePath(upload));
+  const storageReservation = needsTempDir
+    ? await reserveManagedStorageBytes({
+      storageRoot: tempRoot,
+      maxBytes: resolveManagedStorageMaxBytes(),
+      bytes: [imageBinary, voiceoverBinary]
+        .filter((upload) => upload != null && !hasDirectUploadFilePath(upload))
+        .reduce((totalBytes, upload) => totalBytes + getUploadSizeBytes(upload), 0),
+    })
+    : null;
+  const tempDir = needsTempDir
+    ? await mkdtemp(path.join(tempRoot, GENERATE_CLIP_UPLOAD_DIR_PREFIX))
+    : null;
 
   try {
-    if (imageBinary != null && imageBinary.buffer == null) {
+    if (imageBinary != null && !hasBinaryUploadSource(imageBinary)) {
       throw new Error('image_binary must be sent as an n8n binary file upload.');
     }
 
-    if (voiceoverBinary != null && voiceoverBinary.buffer == null) {
+    if (voiceoverBinary != null && !hasBinaryUploadSource(voiceoverBinary)) {
       throw new Error('voiceover_binary must be sent as an n8n binary file upload.');
     }
 
@@ -1076,26 +1495,41 @@ export async function materializeGenerateClipBinaryInputs(requestBody, tempRoot 
         ? null
         : await writeBinaryUploadToTempFile(voiceoverBinary, tempDir, 'voiceover-upload', '.wav'),
       cleanup: async () => {
-        await rm(tempDir, { recursive: true, force: true });
+        if (tempDir != null) {
+          await rm(tempDir, { recursive: true, force: true });
+        }
+        storageReservation?.release();
       },
     };
   } catch (error) {
-    await rm(tempDir, { recursive: true, force: true });
+    if (tempDir != null) {
+      await rm(tempDir, { recursive: true, force: true });
+    }
+    storageReservation?.release();
     throw error;
   }
 }
 
-export async function materializeProbeAudioBinaryInput(requestBody, tempRoot = tmpdir()) {
+export async function materializeProbeAudioBinaryInput(requestBody, tempRoot = resolveManagedStorageRoot()) {
   const audioBinary = requestBody.audio_binary ?? requestBody.audioBinary;
 
   if (audioBinary == null) {
     return null;
   }
 
-  const tempDir = await mkdtemp(path.join(tempRoot, PROBE_AUDIO_UPLOAD_DIR_PREFIX));
+  const storageReservation = hasDirectUploadFilePath(audioBinary)
+    ? null
+    : await reserveManagedStorageBytes({
+      storageRoot: tempRoot,
+      maxBytes: resolveManagedStorageMaxBytes(),
+      bytes: getUploadSizeBytes(audioBinary),
+    });
+  const tempDir = hasDirectUploadFilePath(audioBinary)
+    ? null
+    : await mkdtemp(path.join(tempRoot, PROBE_AUDIO_UPLOAD_DIR_PREFIX));
 
   try {
-    if (audioBinary.buffer == null) {
+    if (!hasBinaryUploadSource(audioBinary)) {
       throw new Error('audio_binary must be sent as an n8n binary file upload.');
     }
 
@@ -1107,16 +1541,22 @@ export async function materializeProbeAudioBinaryInput(requestBody, tempRoot = t
       filename: getUploadFilename(audioBinary, 'audio_binary') || 'audio.wav',
       mime_type: getUploadMimeType(audioBinary, 'audio_binary') || 'audio/wav',
       cleanup: async () => {
-        await rm(tempDir, { recursive: true, force: true });
+        if (tempDir != null) {
+          await rm(tempDir, { recursive: true, force: true });
+        }
+        storageReservation?.release();
       },
     };
   } catch (error) {
-    await rm(tempDir, { recursive: true, force: true });
+    if (tempDir != null) {
+      await rm(tempDir, { recursive: true, force: true });
+    }
+    storageReservation?.release();
     throw error;
   }
 }
 
-export async function materializeJoinClipsInputs(requestBody, tempRoot = tmpdir()) {
+export async function materializeJoinClipsInputs(requestBody, tempRoot = resolveManagedStorageRoot()) {
   if (!requestBody || typeof requestBody !== 'object') {
     throw new Error('The request body must be an object.');
   }
@@ -1126,14 +1566,29 @@ export async function materializeJoinClipsInputs(requestBody, tempRoot = tmpdir(
   }
 
   const normalizedClipEntries = requestBody.clips.map((clip, index) => normalizeJoinClipsRequestEntry(clip, index));
-  const needsTempDir = normalizedClipEntries.some((clip) => clip.clip_binary != null);
+  const needsTempDir = normalizedClipEntries.some(
+    (clip) => clip.clip_binary != null && !hasDirectUploadFilePath(clip.clip_binary)
+  );
+  const storageReservation = needsTempDir
+    ? await reserveManagedStorageBytes({
+      storageRoot: tempRoot,
+      maxBytes: resolveManagedStorageMaxBytes(),
+      bytes: normalizedClipEntries.reduce((totalBytes, clip) => {
+        if (clip.clip_binary == null || hasDirectUploadFilePath(clip.clip_binary)) {
+          return totalBytes;
+        }
+
+        return totalBytes + getUploadSizeBytes(clip.clip_binary);
+      }, 0),
+    })
+    : null;
   const tempDir = needsTempDir
     ? await mkdtemp(path.join(tempRoot, JOIN_CLIPS_UPLOAD_DIR_PREFIX))
     : null;
 
   try {
     normalizedClipEntries.forEach((clip, index) => {
-      if (clip.clip_binary != null && clip.clip_binary.buffer == null) {
+      if (clip.clip_binary != null && !hasBinaryUploadSource(clip.clip_binary)) {
         throw new Error(`clips[${index}].clip_binary must be sent as an n8n binary file upload.`);
       }
     });
@@ -1150,12 +1605,14 @@ export async function materializeJoinClipsInputs(requestBody, tempRoot = tmpdir(
         if (tempDir != null) {
           await rm(tempDir, { recursive: true, force: true });
         }
+        storageReservation?.release();
       },
     };
   } catch (error) {
     if (tempDir != null) {
       await rm(tempDir, { recursive: true, force: true });
     }
+    storageReservation?.release();
     throw error;
   }
 }
@@ -1351,6 +1808,8 @@ export async function generateClip(requestBody) {
   }
 
   const materializedInputs = await materializeGenerateClipBinaryInputs(requestBody);
+  let outputDir = null;
+  let ownsOutputDir = false;
 
   try {
     if (materializedInputs?.image_path == null) {
@@ -1358,7 +1817,9 @@ export async function generateClip(requestBody) {
     }
 
     const imagePath = materializedInputs.image_path;
-    const outputPath = path.join(materializedInputs.temp_dir, 'generate-clip.mp4');
+    outputDir = materializedInputs.temp_dir ?? await mkdtemp(path.join(resolveManagedStorageRoot(), GENERATE_CLIP_UPLOAD_DIR_PREFIX));
+    ownsOutputDir = materializedInputs.temp_dir == null;
+    const outputPath = path.join(outputDir, 'generate-clip.mp4');
     const overlayText = ensureNonEmptyString(requestBody.overlay_text ?? requestBody.overlayText, 'overlay_text');
     const durationSeconds = getGenerateClipDurationSeconds(requestBody);
     const width = normalizePositiveInteger(requestBody.width, DEFAULT_WIDTH, 'width');
@@ -1439,6 +1900,9 @@ export async function generateClip(requestBody) {
     };
   } finally {
     await materializedInputs?.cleanup?.();
+    if (ownsOutputDir && outputDir != null) {
+      await rm(outputDir, { recursive: true, force: true });
+    }
   }
 }
 
