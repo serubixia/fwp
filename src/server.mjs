@@ -165,6 +165,14 @@ async function persistJobResult(result, { jobId, jobType, storageRoot, storageMa
       throw new Error('result.file_path must point to a file.');
     }
 
+    if (stagedTempDir != null && isPathInsideDirectory(stagedTempDir, storageRoot)) {
+      return {
+        result: sanitizeResult(result),
+        file_path: stagedFilePath,
+        temp_dir: stagedTempDir,
+      };
+    }
+
     const storageReservation = await reserveManagedStorageBytes({
       storageRoot,
       maxBytes: storageMaxBytes,
