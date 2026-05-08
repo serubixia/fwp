@@ -634,16 +634,13 @@ function buildBellEnvelopeExpression(progressExpression) {
 function buildProgressExpressions(totalFrames) {
   const lastFrameIndex = Math.max(totalFrames - 1, 1);
   const progress = `on/${lastFrameIndex}`;
-  const smootherStep = buildSmootherStepExpression(progress);
 
-  // Blend 25% smootherstep + 75% linear to guarantee high minimum velocity
-  // at boundaries.  Pure smootherstep has zero derivative at t=0 and t=1
-  // which causes pixel-quantization jitter in zoompan (integer x/y
-  // truncation).  75% linear keeps boundary velocity at 0.75× average,
-  // virtually eliminating sub-pixel stalling while retaining subtle easing.
+  // Pure linear progress yields constant velocity across the entire motion,
+  // which eliminates the irregular pixel-stepping artefacts that eased curves
+  // produce when combined with zoompan's integer x/y truncation.
   return {
     progress,
-    easedProgress: `(0.75*(${progress})+0.25*(${smootherStep}))`,
+    easedProgress: progress,
   };
 }
 
@@ -928,8 +925,8 @@ export function buildImageTextSceneFilterGraph({
   const normalizedDurationSeconds = normalizePositiveNumber(durationSeconds, 5, 'duration_seconds');
   const normalizedFontSize = normalizePositiveInteger(fontSize, DEFAULT_FONT_SIZE, 'font_size');
   const totalFrames = Math.max(Math.round(normalizedDurationSeconds * normalizedFps), 2);
-  const sourceWidth = Math.ceil(normalizedWidth * 4);
-  const sourceHeight = Math.ceil(normalizedHeight * 4);
+  const sourceWidth = Math.ceil(normalizedWidth * 6);
+  const sourceHeight = Math.ceil(normalizedHeight * 6);
   const imageMotion = buildImageMotionExpressions(normalizedSceneAnimation, {
     durationSeconds: normalizedDurationSeconds,
     totalFrames,
@@ -941,7 +938,7 @@ export function buildImageTextSceneFilterGraph({
   return [
     `[0:v]scale=${sourceWidth}:${sourceHeight}:force_original_aspect_ratio=increase`,
     `crop=${sourceWidth}:${sourceHeight}`,
-    `zoompan=z='${escapeExpression(imageMotion.z)}':x='${escapeExpression(imageMotion.x)}':y='${escapeExpression(imageMotion.y)}':d=1:s=${normalizedWidth}x${normalizedHeight}:fps=${normalizedFps}`,
+    `zoompan=z='${escapeExpression(imageMotion.z)}':x='${escapeExpression(imageMotion.x)}':y='${escapeExpression(imageMotion.y)}':d=${totalFrames}:s=${normalizedWidth}x${normalizedHeight}:fps=${normalizedFps}`,
     `drawtext=fontfile='${escapeFilterLiteral(fontFile)}':text='${escapeDrawtextText(normalizedOverlayText)}':fontcolor=${fontColor}:fontsize=${normalizedFontSize}:x='${escapeExpression(textMotion.x)}':y='${escapeExpression(textMotion.y)}':alpha='${escapeExpression(textMotion.alpha)}':borderw=4:bordercolor=${borderColor}:shadowcolor=black@0.85:shadowx=2:shadowy=2:line_spacing=8`,
     'format=yuv420p[vout]',
   ].join(',');
@@ -1677,12 +1674,6 @@ export function buildGenerateClipFfmpegArgs({
 }) {
   const args = [
     '-y',
-    '-loop',
-    '1',
-    '-framerate',
-    String(fps),
-    '-t',
-    formatNumber(durationSeconds, 3),
     '-i',
     imagePath,
   ];
