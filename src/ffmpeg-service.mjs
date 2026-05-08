@@ -1,6 +1,6 @@
 import { spawn } from 'node:child_process';
 import { createWriteStream } from 'node:fs';
-import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, mkdir, rm, stat, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { Readable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
@@ -1809,7 +1809,7 @@ export async function generateClip(requestBody) {
 
   const materializedInputs = await materializeGenerateClipBinaryInputs(requestBody);
   let outputDir = null;
-  let ownsOutputDir = false;
+  let shouldCleanupOutputDir = false;
 
   try {
     if (materializedInputs?.image_path == null) {
@@ -1817,8 +1817,8 @@ export async function generateClip(requestBody) {
     }
 
     const imagePath = materializedInputs.image_path;
-    outputDir = materializedInputs.temp_dir ?? await mkdtemp(path.join(resolveManagedStorageRoot(), GENERATE_CLIP_UPLOAD_DIR_PREFIX));
-    ownsOutputDir = materializedInputs.temp_dir == null;
+    outputDir = await mkdtemp(path.join(resolveManagedStorageRoot(), GENERATE_CLIP_UPLOAD_DIR_PREFIX));
+    shouldCleanupOutputDir = true;
     const outputPath = path.join(outputDir, 'generate-clip.mp4');
     const overlayText = ensureNonEmptyString(requestBody.overlay_text ?? requestBody.overlayText, 'overlay_text');
     const durationSeconds = getGenerateClipDurationSeconds(requestBody);
@@ -1875,7 +1875,7 @@ export async function generateClip(requestBody) {
       audio,
     }));
 
-    const outputBuffer = await readFile(outputPath);
+    const outputStats = await stat(outputPath);
 
     logInfo('render.generate_clip.completed', {
       duration_seconds: Number(formatNumber(durationSeconds, 3)),
@@ -1884,11 +1884,13 @@ export async function generateClip(requestBody) {
       fps,
       has_voiceover: audio != null,
       output_filename: 'generate-clip.mp4',
-      output_size_bytes: outputBuffer.length,
+      output_size_bytes: outputStats.size,
     });
 
+    shouldCleanupOutputDir = false;
     return {
-      buffer: outputBuffer,
+      file_path: outputPath,
+      temp_dir: outputDir,
       content_type: 'video/mp4',
       filename: 'generate-clip.mp4',
       duration_seconds: Number(formatNumber(durationSeconds, 3)),
@@ -1900,7 +1902,7 @@ export async function generateClip(requestBody) {
     };
   } finally {
     await materializedInputs?.cleanup?.();
-    if (ownsOutputDir && outputDir != null) {
+    if (shouldCleanupOutputDir && outputDir != null) {
       await rm(outputDir, { recursive: true, force: true });
     }
   }
@@ -1912,10 +1914,12 @@ export async function joinVideoClips(requestBody) {
   }
 
   const materializedInputs = await materializeJoinClipsInputs(requestBody);
-  const outputDir = materializedInputs.temp_dir ?? await mkdtemp(path.join(resolveManagedStorageRoot(), JOIN_CLIPS_UPLOAD_DIR_PREFIX));
-  const ownsOutputDir = materializedInputs.temp_dir == null;
+  let outputDir = null;
+  let shouldCleanupOutputDir = false;
 
   try {
+    outputDir = await mkdtemp(path.join(resolveManagedStorageRoot(), JOIN_CLIPS_UPLOAD_DIR_PREFIX));
+    shouldCleanupOutputDir = true;
     const clips = materializedInputs.clips;
     const outputPath = path.join(outputDir, 'join-clips.mp4');
     const width = normalizePositiveInteger(requestBody.width, DEFAULT_WIDTH, 'width');
@@ -1976,7 +1980,7 @@ export async function joinVideoClips(requestBody) {
       },
     }));
 
-    const outputBuffer = await readFile(outputPath);
+    const outputStats = await stat(outputPath);
 
     logInfo('compose.join_clips.completed', {
       clip_count: clips.length,
@@ -1986,11 +1990,13 @@ export async function joinVideoClips(requestBody) {
       fps,
       has_audio: hasAudio,
       output_filename: 'join-clips.mp4',
-      output_size_bytes: outputBuffer.length,
+      output_size_bytes: outputStats.size,
     });
 
+    shouldCleanupOutputDir = false;
     return {
-      buffer: outputBuffer,
+      file_path: outputPath,
+      temp_dir: outputDir,
       content_type: 'video/mp4',
       filename: 'join-clips.mp4',
       total_duration_seconds: totalDurationSeconds,
@@ -2005,7 +2011,7 @@ export async function joinVideoClips(requestBody) {
     };
   } finally {
     await materializedInputs.cleanup();
-    if (ownsOutputDir) {
+    if (shouldCleanupOutputDir && outputDir != null) {
       await rm(outputDir, { recursive: true, force: true });
     }
   }
