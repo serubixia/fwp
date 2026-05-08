@@ -4,6 +4,7 @@ import { mkdtemp, mkdir, rm, stat, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { Readable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
+import { fileURLToPath } from 'node:url';
 
 import { getLogContext, logError, logInfo, logWarn } from './logger.mjs';
 import {
@@ -70,12 +71,16 @@ const DEFAULT_AUDIO_SAMPLE_RATE = 48000;
 const DEFAULT_FONT_SIZE = 72;
 const DEFAULT_FONT_COLOR = 'white';
 const DEFAULT_BORDER_COLOR = 'black@0.45';
+const DEFAULT_SUBTITLE_LANGUAGE = 'es';
+const DEFAULT_SUBTITLE_DEVICE = 'cpu';
+const DEFAULT_SUBTITLE_FORCE_STYLE = 'Alignment=2,MarginV=54,Fontsize=24,PrimaryColour=&H00FFFFFF,OutlineColour=&H80000000,BorderStyle=1,Outline=2,Shadow=0';
 const GENERATE_CLIP_UPLOAD_DIR_PREFIX = 'ffmpeg-api-generate-clip-';
 const JOIN_CLIPS_UPLOAD_DIR_PREFIX = 'ffmpeg-api-join-clips-';
 const PROBE_AUDIO_UPLOAD_DIR_PREFIX = 'ffmpeg-api-probe-audio-';
 const ACTIVE_JOB_PROCESS_KILL_GRACE_MS = 1000;
 const DEFAULT_FFMPEG_COMMAND_TIMEOUT_MS = 30 * 60 * 1000;
 const DEFAULT_FFPROBE_COMMAND_TIMEOUT_MS = 30 * 1000;
+const WHISPERX_ALIGN_SCRIPT_PATH = fileURLToPath(new URL('./whisperx-align.py', import.meta.url));
 const WAV_MIME_TYPES = Object.freeze(['audio/wav', 'audio/x-wav']);
 const MIME_TYPE_EXTENSIONS = Object.freeze({
   'image/png': '.png',
@@ -132,6 +137,18 @@ function normalizeOptionalString(value, fallback) {
   return value.trim();
 }
 
+function normalizeNullableString(value, label) {
+  if (value == null) {
+    return null;
+  }
+
+  if (typeof value !== 'string' || value.trim().length === 0) {
+    throw new Error(`${label} must be a non-empty string.`);
+  }
+
+  return value.trim();
+}
+
 function ensureEnum(value, allowedValues, label) {
   if (!allowedValues.includes(value)) {
     throw new Error(`${label} must be one of: ${allowedValues.join(', ')}.`);
@@ -163,6 +180,14 @@ function escapeFilterLiteral(value) {
     .replace(/\\/g, '\\\\')
     .replace(/'/g, "\\'")
     .replace(/:/g, '\\:');
+}
+
+function escapeFilterOptionValue(value) {
+  return String(value)
+    .replace(/\\/g, '\\\\')
+    .replace(/'/g, "\\'")
+    .replace(/:/g, '\\:')
+    .replace(/,/g, '\\,');
 }
 
 function escapeExpression(value) {
@@ -1236,6 +1261,103 @@ function normalizeAudioSampleRate(value) {
   return normalizePositiveInteger(value, DEFAULT_AUDIO_SAMPLE_RATE, 'audio_sample_rate');
 }
 
+function normalizeLanguageCode(value, label) {
+  const normalizedValue = normalizeOptionalString(value, DEFAULT_SUBTITLE_LANGUAGE)
+    .replace(/_/g, '-')
+    .toLowerCase();
+
+  if (!/^[a-z]{2,3}(?:-[a-z0-9]+)*$/.test(normalizedValue)) {
+    throw new Error(`${label} must be a language code like es or en.`);
+  }
+
+  return normalizedValue;
+}
+
+function resolveWhisperxPythonBinary() {
+  return normalizeOptionalString(
+    process.env.WHISPERX_PYTHON
+      ?? process.env.WHISPERX_PYTHON_BINARY,
+    'python3'
+  );
+}
+
+function resolveWhisperxDevice() {
+  return normalizeOptionalString(process.env.WHISPERX_DEVICE, DEFAULT_SUBTITLE_DEVICE);
+}
+
+function resolveWhisperxModelCacheDir() {
+  return normalizeNullableString(process.env.WHISPERX_MODEL_CACHE_DIR, 'WHISPERX_MODEL_CACHE_DIR');
+}
+
+function normalizeGenerateClipSubtitleRequest(requestBody, audio) {
+  const audioTextValue = requestBody.audio_text ?? requestBody.audioText;
+
+  if (audioTextValue == null) {
+    return null;
+  }
+
+  if (audio == null) {
+    throw new Error('audio_text requires voiceover_binary.');
+  }
+
+  return {
+    audio_text: ensureNonEmptyString(audioTextValue, 'audio_text'),
+    audio_language: normalizeLanguageCode(
+      requestBody.audio_language
+        ?? requestBody.audioLanguage
+        ?? process.env.WHISPERX_DEFAULT_LANGUAGE,
+      'audio_language'
+    ),
+  };
+}
+
+async function createAlignedSubtitleTrack({
+  audioPath,
+  audioText,
+  audioLanguage,
+  outputDir,
+}) {
+  const transcriptPath = path.join(outputDir, 'voiceover-transcript.txt');
+  const subtitlePath = path.join(outputDir, 'voiceover-subtitles.srt');
+  const whisperxArgs = [
+    WHISPERX_ALIGN_SCRIPT_PATH,
+    '--audio-path',
+    audioPath,
+    '--transcript-path',
+    transcriptPath,
+    '--output-path',
+    subtitlePath,
+    '--language',
+    audioLanguage,
+    '--device',
+    resolveWhisperxDevice(),
+  ];
+  const modelCacheDir = resolveWhisperxModelCacheDir();
+
+  if (modelCacheDir != null) {
+    whisperxArgs.push('--model-cache-dir', modelCacheDir);
+  }
+
+  await writeFile(transcriptPath, `${audioText}\n`, 'utf8');
+
+  logInfo('render.generate_clip.subtitles.started', {
+    subtitle_language: audioLanguage,
+  });
+
+  await runCommand(resolveWhisperxPythonBinary(), whisperxArgs);
+
+  logInfo('render.generate_clip.subtitles.completed', {
+    subtitle_language: audioLanguage,
+    subtitle_path: subtitlePath,
+  });
+
+  return {
+    subtitle_path: subtitlePath,
+    subtitle_language: audioLanguage,
+    force_style: DEFAULT_SUBTITLE_FORCE_STYLE,
+  };
+}
+
 function normalizeBinaryBuffer(value, label) {
   if (Buffer.isBuffer(value)) {
     return value;
@@ -1671,6 +1793,7 @@ export function buildGenerateClipFfmpegArgs({
   imagePath,
   outputPath,
   filterGraph,
+  videoOutputLabel = 'vout',
   durationSeconds,
   fps,
   videoCodec,
@@ -1695,7 +1818,7 @@ export function buildGenerateClipFfmpegArgs({
     '-filter_complex',
     filterGraph,
     '-map',
-    '[vout]'
+    `[${videoOutputLabel}]`
   );
 
   if (audio) {
@@ -1745,6 +1868,32 @@ export function buildGenerateClipFfmpegArgs({
   );
 
   return args;
+}
+
+export function buildGenerateClipVideoFilterGraph({ filterGraph, subtitles = null }) {
+  if (subtitles == null) {
+    return {
+      filterGraph,
+      videoOutputLabel: 'vout',
+    };
+  }
+
+  if (typeof subtitles !== 'object' || subtitles.subtitle_path == null) {
+    throw new Error('subtitles.subtitle_path is required when burning subtitles.');
+  }
+
+  const subtitleOptions = [
+    `subtitles='${escapeFilterLiteral(subtitles.subtitle_path)}'`,
+  ];
+
+  if (subtitles.force_style != null) {
+    subtitleOptions.push(`force_style='${escapeFilterOptionValue(subtitles.force_style)}'`);
+  }
+
+  return {
+    filterGraph: `${filterGraph};[vout]${subtitleOptions.join(':')}[vsub]`,
+    videoOutputLabel: 'vsub',
+  };
 }
 
 export function buildJoinClipsFfmpegArgs({
@@ -1831,7 +1980,8 @@ export async function generateClip(requestBody) {
     const encodePreset = getAdaptiveEncodePreset(requestBody.encode_preset ?? requestBody.encodePreset, durationSeconds);
     const crf = normalizeCrf(requestBody.crf);
     const audio = normalizeGenerateClipAudio(requestBody, durationSeconds, materializedInputs);
-    const filterGraph = buildImageTextSceneFilterGraph({
+    const subtitleRequest = normalizeGenerateClipSubtitleRequest(requestBody, audio);
+    const baseFilterGraph = buildImageTextSceneFilterGraph({
       sceneAnimation,
       overlayText,
       width,
@@ -1843,6 +1993,18 @@ export async function generateClip(requestBody) {
       fontColor,
       borderColor,
     });
+    const subtitleTrack = subtitleRequest == null
+      ? null
+      : await createAlignedSubtitleTrack({
+        audioPath: audio.voiceover_path,
+        audioText: subtitleRequest.audio_text,
+        audioLanguage: subtitleRequest.audio_language,
+        outputDir,
+      });
+    const { filterGraph, videoOutputLabel } = buildGenerateClipVideoFilterGraph({
+      filterGraph: baseFilterGraph,
+      subtitles: subtitleTrack,
+    });
 
     logInfo('render.generate_clip.started', {
       duration_seconds: Number(formatNumber(durationSeconds, 3)),
@@ -1850,6 +2012,8 @@ export async function generateClip(requestBody) {
       height,
       fps,
       has_voiceover: audio != null,
+      has_subtitles: subtitleTrack != null,
+      subtitle_language: subtitleTrack?.subtitle_language,
       scene_animation: {
         image_motion_preset: sceneAnimation.image_motion_preset,
         text_motion_preset: sceneAnimation.text_motion_preset,
@@ -1864,6 +2028,7 @@ export async function generateClip(requestBody) {
       imagePath,
       outputPath,
       filterGraph,
+      videoOutputLabel,
       durationSeconds,
       fps,
       videoCodec,
@@ -1880,6 +2045,7 @@ export async function generateClip(requestBody) {
       height,
       fps,
       has_voiceover: audio != null,
+      has_subtitles: subtitleTrack != null,
       output_filename: 'generate-clip.mp4',
       output_size_bytes: outputStats.size,
     });
@@ -1895,6 +2061,7 @@ export async function generateClip(requestBody) {
       height,
       fps,
       has_voiceover: audio != null,
+      has_subtitles: subtitleTrack != null,
       scene_animation: sceneAnimation,
     };
   } finally {
