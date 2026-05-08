@@ -63,7 +63,7 @@ const DEFAULT_CRF = 18;
 const DEFAULT_VIDEO_CODEC = 'libx264';
 const DEFAULT_ENCODE_PRESET = 'medium';
 const LONG_RENDER_ENCODE_PRESET = 'veryfast';
-const LONG_RENDER_THRESHOLD_SECONDS = 20;
+const LONG_RENDER_THRESHOLD_SECONDS = 10;
 const DEFAULT_AUDIO_CODEC = 'aac';
 const DEFAULT_AUDIO_BITRATE = '192k';
 const DEFAULT_AUDIO_SAMPLE_RATE = 48000;
@@ -925,8 +925,10 @@ export function buildImageTextSceneFilterGraph({
   const normalizedDurationSeconds = normalizePositiveNumber(durationSeconds, 5, 'duration_seconds');
   const normalizedFontSize = normalizePositiveInteger(fontSize, DEFAULT_FONT_SIZE, 'font_size');
   const totalFrames = Math.max(Math.round(normalizedDurationSeconds * normalizedFps), 2);
-  const sourceWidth = Math.ceil(normalizedWidth * 6);
-  const sourceHeight = Math.ceil(normalizedHeight * 6);
+  const isStaticHold = normalizedSceneAnimation.image_motion_preset === 'static_hold';
+  const sourceMultiplier = isStaticHold ? 2 : 6;
+  const sourceWidth = Math.ceil(normalizedWidth * sourceMultiplier);
+  const sourceHeight = Math.ceil(normalizedHeight * sourceMultiplier);
   const imageMotion = buildImageMotionExpressions(normalizedSceneAnimation, {
     durationSeconds: normalizedDurationSeconds,
     totalFrames,
@@ -935,12 +937,18 @@ export function buildImageTextSceneFilterGraph({
   });
   const textMotion = buildTextAnimationExpressions(normalizedSceneAnimation, normalizedDurationSeconds);
 
-  const imageChain = [
-    `[0:v]scale=${sourceWidth}:${sourceHeight}:force_original_aspect_ratio=increase`,
+  const imageChainParts = [
+    `[0:v]scale=${sourceWidth}:${sourceHeight}:force_original_aspect_ratio=increase:flags=fast_bilinear`,
     `crop=${sourceWidth}:${sourceHeight}`,
     `zoompan=z='${escapeExpression(imageMotion.z)}':x='${escapeExpression(imageMotion.x)}':y='${escapeExpression(imageMotion.y)}':d=${totalFrames}:s=${normalizedWidth}x${normalizedHeight}:fps=${normalizedFps}`,
-    `tmix=frames=2:weights='1 1'[img]`,
-  ].join(',');
+  ];
+
+  if (!isStaticHold) {
+    imageChainParts.push(`tmix=frames=2:weights='1 1'`);
+  }
+
+  imageChainParts.push(`setsar=1[img]`);
+  const imageChain = imageChainParts.join(',');
 
   const textChain = [
     `[img]drawtext=fontfile='${escapeFilterLiteral(fontFile)}':text='${escapeDrawtextText(normalizedOverlayText)}':fontcolor=${fontColor}:fontsize=${normalizedFontSize}:x='${escapeExpression(textMotion.x)}':y='${escapeExpression(textMotion.y)}':alpha='${escapeExpression(textMotion.alpha)}':borderw=4:bordercolor=${borderColor}:shadowcolor=black@0.85:shadowx=2:shadowy=2:line_spacing=8`,
@@ -1735,6 +1743,8 @@ export function buildGenerateClipFfmpegArgs({
     videoCodec,
     '-preset',
     encodePreset,
+    '-tune',
+    'stillimage',
     '-crf',
     String(crf),
     '-pix_fmt',
