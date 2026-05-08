@@ -1,7 +1,6 @@
 import { spawn } from 'node:child_process';
 import { createWriteStream } from 'node:fs';
 import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { Readable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
@@ -13,7 +12,7 @@ import {
   resolveManagedStorageRoot,
 } from './storage-manager.mjs';
 
-export const SCENE_IMAGE_MOTION_PRESETS = Object.freeze([
+const SCENE_IMAGE_MOTION_PRESETS = Object.freeze([
   'static_hold',
   'slow_push_in',
   'slow_pull_out',
@@ -24,7 +23,7 @@ export const SCENE_IMAGE_MOTION_PRESETS = Object.freeze([
   'parallax_float',
 ]);
 
-export const SCENE_TEXT_MOTION_PRESETS = Object.freeze([
+const SCENE_TEXT_MOTION_PRESETS = Object.freeze([
   'fade_in_hold',
   'fade_up_soft',
   'slide_left_soft',
@@ -32,9 +31,9 @@ export const SCENE_TEXT_MOTION_PRESETS = Object.freeze([
   'type_on_soft',
 ]);
 
-export const SCENE_ANIMATION_SPEEDS = Object.freeze(['slow', 'medium']);
-export const SCENE_TEXT_ANCHORS = Object.freeze(['upper_third', 'center', 'lower_third']);
-export const SCENE_TRANSITION_PRESETS = Object.freeze([
+const SCENE_ANIMATION_SPEEDS = Object.freeze(['slow', 'medium']);
+const SCENE_TEXT_ANCHORS = Object.freeze(['upper_third', 'center', 'lower_third']);
+const SCENE_TRANSITION_PRESETS = Object.freeze([
   'none',
   'fade',
   'wipe_left',
@@ -544,11 +543,11 @@ export async function runCommand(binary, args, { timeoutMs } = {}) {
   });
 }
 
-export function getWorkspaceRoot() {
+function getWorkspaceRoot() {
   return path.resolve(process.env.WORKSPACE_ROOT || '/workspace');
 }
 
-export function resolveWorkspacePath(inputPath, label) {
+function resolveWorkspacePath(inputPath, label) {
   const rawPath = ensureNonEmptyString(inputPath, label);
   const workspaceRoot = getWorkspaceRoot();
   const resolvedPath = path.resolve(workspaceRoot, rawPath);
@@ -1913,7 +1912,7 @@ export async function joinVideoClips(requestBody) {
   }
 
   const materializedInputs = await materializeJoinClipsInputs(requestBody);
-  const outputDir = materializedInputs.temp_dir ?? await mkdtemp(path.join(tmpdir(), JOIN_CLIPS_UPLOAD_DIR_PREFIX));
+  const outputDir = materializedInputs.temp_dir ?? await mkdtemp(path.join(resolveManagedStorageRoot(), JOIN_CLIPS_UPLOAD_DIR_PREFIX));
   const ownsOutputDir = materializedInputs.temp_dir == null;
 
   try {
