@@ -637,13 +637,14 @@ function buildProgressExpressions(totalFrames) {
   const progress = `on/${lastFrameIndex}`;
   const smootherStep = buildSmootherStepExpression(progress);
 
-  // Blend 50% smootherstep + 50% linear to guarantee non-zero velocity at
-  // boundaries.  Pure smootherstep has zero derivative at t=0 and t=1 which
-  // causes pixel-quantization jitter in zoompan (integer x/y truncation)
-  // when the per-frame position delta drops below 1 source pixel.
+  // Blend 25% smootherstep + 75% linear to guarantee high minimum velocity
+  // at boundaries.  Pure smootherstep has zero derivative at t=0 and t=1
+  // which causes pixel-quantization jitter in zoompan (integer x/y
+  // truncation).  75% linear keeps boundary velocity at 0.75× average,
+  // virtually eliminating sub-pixel stalling while retaining subtle easing.
   return {
     progress,
-    easedProgress: `(0.5*(${smootherStep})+0.5*(${progress}))`,
+    easedProgress: `(0.75*(${progress})+0.25*(${smootherStep}))`,
   };
 }
 
