@@ -383,6 +383,8 @@ function summarizeGenerateClipPayload(payload) {
     has_audio_text: typeof payload.audio_text === 'string',
     audio_text_length: payload.audio_text?.length,
     audio_language: payload.audio_language,
+    subtitle_theme: payload.subtitle_theme,
+    subtitle_highlight_words: payload.subtitle_highlight_words,
     overlay_text_length: payload.overlay_text?.length,
     scene_animation: payload.scene_animation == null
       ? undefined
@@ -1464,10 +1466,14 @@ async function readGenerateClipMultipartBody(request, url, storageOptions) {
   const formData = await readMultipartFormData(request, url, MAX_GENERATE_CLIP_BODY_BYTES, storageOptions);
 
   try {
+    const subtitleHighlightWords = readFormTextField(formData, 'subtitle_highlight_words')
+      ?? readFormTextField(formData, 'highlight_words');
     const payload = {
       overlay_text: readFormTextField(formData, 'overlay_text', { required: true }),
       audio_text: readFormTextField(formData, 'audio_text'),
       audio_language: readFormTextField(formData, 'audio_language'),
+      subtitle_theme: readFormTextField(formData, 'subtitle_theme'),
+      subtitle_highlight_words: subtitleHighlightWords,
       duration_seconds: readFormTextField(formData, 'duration_seconds', { required: true }),
       width: readFormTextField(formData, 'width'),
       height: readFormTextField(formData, 'height'),
