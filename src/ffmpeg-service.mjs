@@ -73,7 +73,65 @@ const DEFAULT_FONT_COLOR = 'white';
 const DEFAULT_BORDER_COLOR = 'black@0.45';
 const DEFAULT_SUBTITLE_LANGUAGE = 'es';
 const DEFAULT_SUBTITLE_DEVICE = 'cpu';
-const DEFAULT_SUBTITLE_FORCE_STYLE = 'Alignment=2,MarginV=54,Fontsize=24,PrimaryColour=&H00FFFFFF,OutlineColour=&H80000000,BorderStyle=1,Outline=2,Shadow=0';
+const DEFAULT_SUBTITLE_THEME = 'default';
+const SUBTITLE_THEME_PROFILES = Object.freeze({
+  default: Object.freeze({
+    font_name: 'DejaVu Sans',
+    font_size: 30,
+    base_colour: '&H00FFFFFF',
+    highlight_colour: '&H004AD5FF',
+    outline_colour: '&H00101010',
+    back_colour: '&H64000000',
+    alignment: 2,
+    margin_l: 80,
+    margin_r: 80,
+    margin_v: 64,
+    bold: -1,
+    uppercase: false,
+  }),
+  lime: Object.freeze({
+    font_name: 'DejaVu Sans',
+    font_size: 32,
+    base_colour: '&H00FFFFFF',
+    highlight_colour: '&H0056FF6A',
+    outline_colour: '&H00101010',
+    back_colour: '&H64000000',
+    alignment: 2,
+    margin_l: 76,
+    margin_r: 76,
+    margin_v: 60,
+    bold: -1,
+    uppercase: false,
+  }),
+  top: Object.freeze({
+    font_name: 'DejaVu Sans',
+    font_size: 28,
+    base_colour: '&H00FFFFFF',
+    highlight_colour: '&H00759CFF',
+    outline_colour: '&H00101010',
+    back_colour: '&H64000000',
+    alignment: 8,
+    margin_l: 84,
+    margin_r: 84,
+    margin_v: 72,
+    bold: -1,
+    uppercase: false,
+  }),
+  caps: Object.freeze({
+    font_name: 'DejaVu Sans',
+    font_size: 34,
+    base_colour: '&H00FFFFFF',
+    highlight_colour: '&H0000D7FF',
+    outline_colour: '&H00101010',
+    back_colour: '&H64000000',
+    alignment: 2,
+    margin_l: 72,
+    margin_r: 72,
+    margin_v: 58,
+    bold: -1,
+    uppercase: true,
+  }),
+});
 const GENERATE_CLIP_UPLOAD_DIR_PREFIX = 'ffmpeg-api-generate-clip-';
 const JOIN_CLIPS_UPLOAD_DIR_PREFIX = 'ffmpeg-api-join-clips-';
 const PROBE_AUDIO_UPLOAD_DIR_PREFIX = 'ffmpeg-api-probe-audio-';
@@ -147,6 +205,30 @@ function normalizeNullableString(value, label) {
   }
 
   return value.trim();
+}
+
+function normalizeOptionalBoolean(value, fallback, label) {
+  if (value == null) {
+    return fallback;
+  }
+
+  if (typeof value === 'boolean') {
+    return value;
+  }
+
+  if (typeof value === 'string') {
+    const normalizedValue = value.trim().toLowerCase();
+
+    if (['true', '1', 'yes', 'on'].includes(normalizedValue)) {
+      return true;
+    }
+
+    if (['false', '0', 'no', 'off'].includes(normalizedValue)) {
+      return false;
+    }
+  }
+
+  throw new Error(`${label} must be a boolean.`);
 }
 
 function ensureEnum(value, allowedValues, label) {
@@ -1273,6 +1355,35 @@ function normalizeLanguageCode(value, label) {
   return normalizedValue;
 }
 
+function normalizeSubtitleTheme(value) {
+  const normalizedValue = normalizeOptionalString(value, DEFAULT_SUBTITLE_THEME).toLowerCase();
+  return ensureEnum(normalizedValue, Object.keys(SUBTITLE_THEME_PROFILES), 'subtitle_theme');
+}
+
+function getSubtitleThemeProfile(theme) {
+  return SUBTITLE_THEME_PROFILES[normalizeSubtitleTheme(theme)];
+}
+
+function buildSubtitleForceStyle(subtitleTheme) {
+  const themeProfile = getSubtitleThemeProfile(subtitleTheme);
+
+  return [
+    `FontName=${themeProfile.font_name}`,
+    `Fontsize=${themeProfile.font_size}`,
+    `PrimaryColour=${themeProfile.base_colour}`,
+    `OutlineColour=${themeProfile.outline_colour}`,
+    `BackColour=${themeProfile.back_colour}`,
+    `Bold=${themeProfile.bold}`,
+    `Alignment=${themeProfile.alignment}`,
+    `MarginL=${themeProfile.margin_l}`,
+    `MarginR=${themeProfile.margin_r}`,
+    `MarginV=${themeProfile.margin_v}`,
+    'BorderStyle=1',
+    'Outline=2',
+    'Shadow=0',
+  ].join(',');
+}
+
 function resolveWhisperxPythonBinary() {
   return normalizeOptionalString(
     process.env.WHISPERX_PYTHON
@@ -1308,6 +1419,19 @@ function normalizeGenerateClipSubtitleRequest(requestBody, audio) {
         ?? process.env.WHISPERX_DEFAULT_LANGUAGE,
       'audio_language'
     ),
+    subtitle_theme: normalizeSubtitleTheme(
+      requestBody.subtitle_theme
+        ?? requestBody.subtitleTheme
+        ?? process.env.WHISPERX_SUBTITLE_THEME,
+    ),
+    highlight_words: normalizeOptionalBoolean(
+      requestBody.subtitle_highlight_words
+        ?? requestBody.subtitleHighlightWords
+        ?? requestBody.highlight_words
+        ?? requestBody.highlightWords,
+      false,
+      'subtitle_highlight_words'
+    ),
   };
 }
 
@@ -1315,10 +1439,12 @@ async function createAlignedSubtitleTrack({
   audioPath,
   audioText,
   audioLanguage,
+  subtitleTheme,
+  highlightWords = false,
   outputDir,
 }) {
   const transcriptPath = path.join(outputDir, 'voiceover-transcript.txt');
-  const subtitlePath = path.join(outputDir, 'voiceover-subtitles.srt');
+  const subtitlePath = path.join(outputDir, `voiceover-subtitles${highlightWords ? '.ass' : '.srt'}`);
   const whisperxArgs = [
     WHISPERX_ALIGN_SCRIPT_PATH,
     '--audio-path',
@@ -1331,6 +1457,8 @@ async function createAlignedSubtitleTrack({
     audioLanguage,
     '--device',
     resolveWhisperxDevice(),
+    '--theme',
+    subtitleTheme,
   ];
   const modelCacheDir = resolveWhisperxModelCacheDir();
 
@@ -1338,23 +1466,33 @@ async function createAlignedSubtitleTrack({
     whisperxArgs.push('--model-cache-dir', modelCacheDir);
   }
 
+  if (highlightWords) {
+    whisperxArgs.push('--highlight-words');
+  }
+
   await writeFile(transcriptPath, `${audioText}\n`, 'utf8');
 
   logInfo('render.generate_clip.subtitles.started', {
     subtitle_language: audioLanguage,
+    subtitle_theme: subtitleTheme,
+    subtitle_highlight_words: highlightWords,
   });
 
   await runCommand(resolveWhisperxPythonBinary(), whisperxArgs);
 
   logInfo('render.generate_clip.subtitles.completed', {
     subtitle_language: audioLanguage,
+    subtitle_theme: subtitleTheme,
+    subtitle_highlight_words: highlightWords,
     subtitle_path: subtitlePath,
   });
 
   return {
     subtitle_path: subtitlePath,
     subtitle_language: audioLanguage,
-    force_style: DEFAULT_SUBTITLE_FORCE_STYLE,
+    subtitle_theme: subtitleTheme,
+    highlight_words: highlightWords,
+    force_style: highlightWords ? null : buildSubtitleForceStyle(subtitleTheme),
   };
 }
 
@@ -1999,6 +2137,8 @@ export async function generateClip(requestBody) {
         audioPath: audio.voiceover_path,
         audioText: subtitleRequest.audio_text,
         audioLanguage: subtitleRequest.audio_language,
+        subtitleTheme: subtitleRequest.subtitle_theme,
+        highlightWords: subtitleRequest.highlight_words,
         outputDir,
       });
     const { filterGraph, videoOutputLabel } = buildGenerateClipVideoFilterGraph({
@@ -2014,6 +2154,8 @@ export async function generateClip(requestBody) {
       has_voiceover: audio != null,
       has_subtitles: subtitleTrack != null,
       subtitle_language: subtitleTrack?.subtitle_language,
+      subtitle_theme: subtitleTrack?.subtitle_theme,
+      subtitle_highlight_words: subtitleTrack?.highlight_words,
       scene_animation: {
         image_motion_preset: sceneAnimation.image_motion_preset,
         text_motion_preset: sceneAnimation.text_motion_preset,
@@ -2046,6 +2188,8 @@ export async function generateClip(requestBody) {
       fps,
       has_voiceover: audio != null,
       has_subtitles: subtitleTrack != null,
+      subtitle_theme: subtitleTrack?.subtitle_theme,
+      subtitle_highlight_words: subtitleTrack?.highlight_words,
       output_filename: 'generate-clip.mp4',
       output_size_bytes: outputStats.size,
     });
@@ -2062,6 +2206,8 @@ export async function generateClip(requestBody) {
       fps,
       has_voiceover: audio != null,
       has_subtitles: subtitleTrack != null,
+      subtitle_theme: subtitleTrack?.subtitle_theme ?? DEFAULT_SUBTITLE_THEME,
+      subtitle_highlight_words: subtitleTrack?.highlight_words ?? false,
       scene_animation: sceneAnimation,
     };
   } finally {
