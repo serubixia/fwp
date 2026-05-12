@@ -1,6 +1,6 @@
 import { spawn } from 'node:child_process';
 import { createWriteStream, readdirSync } from 'node:fs';
-import { mkdtemp, mkdir, rm, stat, writeFile } from 'node:fs/promises';
+import { mkdtemp, mkdir, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { Readable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
@@ -86,11 +86,14 @@ const DEFAULT_BORDER_COLOR = 'black@0.45';
 const DEFAULT_SUBTITLE_LANGUAGE = 'es';
 const DEFAULT_SUBTITLE_DEVICE = 'cpu';
 const DEFAULT_SUBTITLE_THEME = 'default';
+const DEFAULT_SUBTITLE_DELIVERY = 'burned';
+const SUBTITLE_DELIVERY_OPTIONS = Object.freeze(['burned', 'external']);
 const SUBTITLE_LAYOUT_BASE_WIDTH = 1920;
 const SUBTITLE_LAYOUT_BASE_HEIGHT = 1080;
 const LIBASS_DEFAULT_PLAYRES_X = 384;
 const LIBASS_DEFAULT_PLAYRES_Y = 288;
 const DEFAULT_SUBTITLE_OUTLINE = 2;
+const SRT_CONTENT_TYPE = 'application/x-subrip';
 const SUBTITLE_THEME_PROFILES = Object.freeze({
   default: Object.freeze({
     font_name: 'DejaVu Sans',
@@ -1221,6 +1224,8 @@ function normalizeJoinClipsRequestEntry(clip, index) {
 
   const clipPath = clip.clip_path ?? clip.path;
   const clipBinary = clip.clip_binary ?? clip.clipBinary;
+  const subtitlePath = clip.subtitle_path ?? clip.subtitlePath;
+  const subtitleBinary = clip.subtitle_binary ?? clip.subtitleBinary;
 
   if (clipPath == null && clipBinary == null) {
     throw new Error(`clips[${index}] must include clip_path or clip_binary.`);
@@ -1230,9 +1235,15 @@ function normalizeJoinClipsRequestEntry(clip, index) {
     throw new Error(`clips[${index}] must not include both clip_path and clip_binary.`);
   }
 
+  if (subtitlePath != null && subtitleBinary != null) {
+    throw new Error(`clips[${index}] must not include both subtitle_path and subtitle_binary.`);
+  }
+
   return {
     clip_path: clipPath == null ? null : ensureNonEmptyString(clipPath, `clips[${index}].clip_path`),
     clip_binary: clipBinary ?? null,
+    subtitle_path: subtitlePath == null ? null : ensureNonEmptyString(subtitlePath, `clips[${index}].subtitle_path`),
+    subtitle_binary: subtitleBinary ?? null,
     transition_to_next: validateSceneTransition(
       clip.transition_to_next,
       { label: `clips[${index}].transition_to_next` }
@@ -1639,6 +1650,11 @@ function normalizeSubtitleTheme(value) {
   return ensureEnum(normalizedValue, Object.keys(SUBTITLE_THEME_PROFILES), 'subtitle_theme');
 }
 
+function normalizeSubtitleDelivery(value) {
+  const normalizedValue = normalizeOptionalString(value, DEFAULT_SUBTITLE_DELIVERY).toLowerCase();
+  return ensureEnum(normalizedValue, SUBTITLE_DELIVERY_OPTIONS, 'subtitle_delivery');
+}
+
 function getSubtitleThemeProfile(theme) {
   return SUBTITLE_THEME_PROFILES[normalizeSubtitleTheme(theme)];
 }
@@ -1753,6 +1769,24 @@ function normalizeGenerateClipSubtitleRequest(requestBody, audio) {
     throw new Error('audio_text requires voiceover_binary.');
   }
 
+  const subtitleDelivery = normalizeSubtitleDelivery(
+    requestBody.subtitle_delivery
+      ?? requestBody.subtitleDelivery
+      ?? process.env.WHISPERX_SUBTITLE_DELIVERY,
+  );
+  const highlightWords = normalizeOptionalBoolean(
+    requestBody.subtitle_highlight_words
+      ?? requestBody.subtitleHighlightWords
+      ?? requestBody.highlight_words
+      ?? requestBody.highlightWords,
+    false,
+    'subtitle_highlight_words'
+  );
+
+  if (subtitleDelivery === 'external' && highlightWords) {
+    throw new Error('subtitle_highlight_words is only supported with subtitle_delivery=burned.');
+  }
+
   return {
     audio_text: ensureNonEmptyString(audioTextValue, 'audio_text'),
     audio_language: normalizeLanguageCode(
@@ -1766,14 +1800,8 @@ function normalizeGenerateClipSubtitleRequest(requestBody, audio) {
         ?? requestBody.subtitleTheme
         ?? process.env.WHISPERX_SUBTITLE_THEME,
     ),
-    highlight_words: normalizeOptionalBoolean(
-      requestBody.subtitle_highlight_words
-        ?? requestBody.subtitleHighlightWords
-        ?? requestBody.highlight_words
-        ?? requestBody.highlightWords,
-      false,
-      'subtitle_highlight_words'
-    ),
+    subtitle_delivery: subtitleDelivery,
+    highlight_words: highlightWords,
   };
 }
 
@@ -1782,6 +1810,7 @@ async function createAlignedSubtitleTrack({
   audioText,
   audioLanguage,
   subtitleTheme,
+  subtitleDelivery = DEFAULT_SUBTITLE_DELIVERY,
   highlightWords = false,
   width,
   height,
@@ -1790,7 +1819,12 @@ async function createAlignedSubtitleTrack({
   const scaledThemeProfile = getScaledSubtitleThemeProfile(subtitleTheme, width, height);
   const subtitleTextLayout = resolveSubtitleTextLayout(scaledThemeProfile, width, height);
   const transcriptPath = path.join(outputDir, 'voiceover-transcript.txt');
-  const subtitlePath = path.join(outputDir, `voiceover-subtitles${highlightWords ? '.ass' : '.srt'}`);
+  const subtitleExtension = subtitleDelivery === 'external'
+    ? '.srt'
+    : highlightWords
+      ? '.ass'
+      : '.srt';
+  const subtitlePath = path.join(outputDir, `voiceover-subtitles${subtitleExtension}`);
   const whisperxArgs = [
     WHISPERX_ALIGN_SCRIPT_PATH,
     '--audio-path',
@@ -1845,6 +1879,8 @@ async function createAlignedSubtitleTrack({
     subtitle_path: subtitlePath,
     subtitle_language: audioLanguage,
     subtitle_theme: subtitleTheme,
+    subtitle_content_type: SRT_CONTENT_TYPE,
+    delivery: subtitleDelivery,
     highlight_words: highlightWords,
     force_style: highlightWords
       ? buildAssSubtitleForceStyle(subtitleTheme, width, height)
@@ -2188,18 +2224,27 @@ export async function materializeJoinClipsInputs(requestBody, tempRoot = resolve
   const normalizedClipEntries = requestBody.clips.map((clip, index) => normalizeJoinClipsRequestEntry(clip, index));
   const backgroundMusicRequest = normalizeJoinClipsBackgroundMusicRequest(requestBody);
   const needsTempDir = normalizedClipEntries.some(
-    (clip) => clip.clip_binary != null && !hasDirectUploadFilePath(clip.clip_binary)
+    (clip) => (
+      (clip.clip_binary != null && !hasDirectUploadFilePath(clip.clip_binary))
+      || (clip.subtitle_binary != null && !hasDirectUploadFilePath(clip.subtitle_binary))
+    )
   );
   const storageReservation = needsTempDir
     ? await reserveManagedStorageBytes({
       storageRoot: tempRoot,
       maxBytes: resolveManagedStorageMaxBytes(),
       bytes: normalizedClipEntries.reduce((totalBytes, clip) => {
-        if (clip.clip_binary == null || hasDirectUploadFilePath(clip.clip_binary)) {
-          return totalBytes;
+        let nextTotalBytes = totalBytes;
+
+        if (clip.clip_binary != null && !hasDirectUploadFilePath(clip.clip_binary)) {
+          nextTotalBytes += getUploadSizeBytes(clip.clip_binary);
         }
 
-        return totalBytes + getUploadSizeBytes(clip.clip_binary);
+        if (clip.subtitle_binary != null && !hasDirectUploadFilePath(clip.subtitle_binary)) {
+          nextTotalBytes += getUploadSizeBytes(clip.subtitle_binary);
+        }
+
+        return nextTotalBytes;
       }, 0),
     })
     : null;
@@ -2212,6 +2257,10 @@ export async function materializeJoinClipsInputs(requestBody, tempRoot = resolve
       if (clip.clip_binary != null && !hasBinaryUploadSource(clip.clip_binary)) {
         throw new Error(`clips[${index}].clip_binary must be sent as an n8n binary file upload.`);
       }
+
+      if (clip.subtitle_binary != null && !hasBinaryUploadSource(clip.subtitle_binary)) {
+        throw new Error(`clips[${index}].subtitle_binary must be sent as an n8n binary file upload.`);
+      }
     });
 
     return {
@@ -2220,6 +2269,9 @@ export async function materializeJoinClipsInputs(requestBody, tempRoot = resolve
         clip_path: clip.clip_binary == null
           ? resolveWorkspacePath(clip.clip_path, `clips[${index}].clip_path`)
           : await writeBinaryUploadToTempFile(clip.clip_binary, tempDir, `clip-${String(index + 1).padStart(2, '0')}`, '.mp4'),
+        subtitle_path: clip.subtitle_binary == null
+          ? (clip.subtitle_path == null ? null : resolveWorkspacePath(clip.subtitle_path, `clips[${index}].subtitle_path`))
+          : await writeBinaryUploadToTempFile(clip.subtitle_binary, tempDir, `clip-${String(index + 1).padStart(2, '0')}-subtitle`, '.srt'),
         transition_to_next: clip.transition_to_next,
       }))),
       background_music_id: backgroundMusicRequest.background_music_id,
@@ -2334,6 +2386,150 @@ function buildPreparedAudioStreamFilter({
   }
 
   return `${filterParts.join(',')}[${outputLabel}]`;
+}
+
+function parseSrtTimestamp(value, label = 'subtitle timestamp') {
+  const match = String(value).trim().match(/^(\d{2,}):(\d{2}):(\d{2}),(\d{3})$/);
+  if (!match) {
+    throw new Error(`${label} must use HH:MM:SS,mmm.`);
+  }
+
+  const hours = Number(match[1]);
+  const minutes = Number(match[2]);
+  const seconds = Number(match[3]);
+  const milliseconds = Number(match[4]);
+
+  if (minutes >= 60 || seconds >= 60) {
+    throw new Error(`${label} must use valid clock values.`);
+  }
+
+  return (((hours * 60) + minutes) * 60) + seconds + (milliseconds / 1000);
+}
+
+function formatSrtTimestamp(seconds) {
+  const totalMilliseconds = Math.max(0, Math.round(Number(seconds) * 1000));
+  const hours = Math.floor(totalMilliseconds / 3600000);
+  const minutes = Math.floor((totalMilliseconds % 3600000) / 60000);
+  const wholeSeconds = Math.floor((totalMilliseconds % 60000) / 1000);
+  const milliseconds = totalMilliseconds % 1000;
+
+  return `${String(hours).padStart(2, '0')}:${String(minutes).padStart(2, '0')}:${String(wholeSeconds).padStart(2, '0')},${String(milliseconds).padStart(3, '0')}`;
+}
+
+function parseSrtCues(content, label) {
+  const normalizedContent = String(content).replace(/\r\n/g, '\n').trim();
+  if (normalizedContent.length === 0) {
+    return [];
+  }
+
+  return normalizedContent.split(/\n{2,}/).map((block, index) => {
+    const rawLines = block.split('\n').map((line) => line.trimEnd());
+    const lines = rawLines[0] != null && /^\d+$/.test(rawLines[0].trim())
+      ? rawLines.slice(1)
+      : rawLines;
+    const timeLine = lines[0];
+
+    if (typeof timeLine !== 'string' || !timeLine.includes('-->')) {
+      throw new Error(`${label} cue ${index + 1} is missing a valid time range.`);
+    }
+
+    const [rawStart, rawEnd] = timeLine.split('-->').map((value) => value.trim());
+    const cueText = lines.slice(1).join('\n').trim();
+    const startSeconds = parseSrtTimestamp(rawStart, `${label} cue ${index + 1} start`);
+    const endSeconds = parseSrtTimestamp(rawEnd, `${label} cue ${index + 1} end`);
+
+    if (cueText.length === 0) {
+      throw new Error(`${label} cue ${index + 1} must contain subtitle text.`);
+    }
+
+    if (endSeconds <= startSeconds) {
+      throw new Error(`${label} cue ${index + 1} must end after it starts.`);
+    }
+
+    return {
+      start_seconds: startSeconds,
+      end_seconds: endSeconds,
+      text: cueText,
+    };
+  });
+}
+
+function stringifySrtCues(cues) {
+  return cues.map((cue, index) => [
+    String(index + 1),
+    `${formatSrtTimestamp(cue.start_seconds)} --> ${formatSrtTimestamp(cue.end_seconds)}`,
+    cue.text,
+  ].join('\n')).join('\n\n');
+}
+
+function buildJoinSubtitleTimeline(clips, durations) {
+  let currentOffsetSeconds = 0;
+
+  return clips.map((clip, index) => {
+    const segmentDurationSeconds = index === clips.length - 1
+      ? durations[index]
+      : durations[index] - clip.transition_to_next.duration_seconds;
+
+    if (!Number.isFinite(segmentDurationSeconds) || segmentDurationSeconds <= 0) {
+      throw new Error(`Subtitle segment ${index} must have a positive duration after transition trimming.`);
+    }
+
+    const timelineEntry = {
+      clip_index: index,
+      offset_seconds: Number(formatNumber(currentOffsetSeconds, 3)),
+      segment_duration_seconds: Number(formatNumber(segmentDurationSeconds, 3)),
+    };
+
+    currentOffsetSeconds += segmentDurationSeconds;
+    return timelineEntry;
+  });
+}
+
+async function buildMergedJoinClipsSubtitleArtifact({ clips, durations, outputDir }) {
+  const subtitleTimeline = buildJoinSubtitleTimeline(clips, durations);
+  const cues = [];
+
+  for (const timelineEntry of subtitleTimeline) {
+    const clip = clips[timelineEntry.clip_index];
+    if (clip.subtitle_path == null) {
+      continue;
+    }
+
+    const clipSubtitleContent = await readFile(clip.subtitle_path, 'utf8');
+    const clipCues = parseSrtCues(clipSubtitleContent, `clips[${timelineEntry.clip_index}].subtitle_path`);
+
+    for (const cue of clipCues) {
+      const trimmedStartSeconds = Math.max(cue.start_seconds, 0);
+      const trimmedEndSeconds = Math.min(cue.end_seconds, timelineEntry.segment_duration_seconds);
+
+      if (trimmedEndSeconds <= trimmedStartSeconds) {
+        continue;
+      }
+
+      cues.push({
+        start_seconds: Number(formatNumber(timelineEntry.offset_seconds + trimmedStartSeconds, 3)),
+        end_seconds: Number(formatNumber(timelineEntry.offset_seconds + trimmedEndSeconds, 3)),
+        text: cue.text,
+      });
+    }
+  }
+
+  if (cues.length === 0) {
+    return null;
+  }
+
+  const outputPath = path.join(outputDir, 'join-clips.srt');
+  await writeFile(outputPath, `${stringifySrtCues(cues)}\n`, 'utf8');
+
+  return {
+    artifact_id: 'subtitle_srt',
+    kind: 'subtitle_track',
+    format: 'srt',
+    file_path: outputPath,
+    filename: path.basename(outputPath),
+    content_type: SRT_CONTENT_TYPE,
+    cue_count: cues.length,
+  };
 }
 
 function buildGenerateClipAudioFilterGraph({
@@ -2499,6 +2695,17 @@ export function buildGenerateClipVideoFilterGraph({ filterGraph, subtitles = nul
     };
   }
 
+  const subtitleDelivery = subtitles.delivery == null
+    ? DEFAULT_SUBTITLE_DELIVERY
+    : normalizeSubtitleDelivery(subtitles.delivery);
+
+  if (subtitleDelivery === 'external') {
+    return {
+      filterGraph,
+      videoOutputLabel: 'vout',
+    };
+  }
+
   if (typeof subtitles !== 'object' || subtitles.subtitle_path == null) {
     throw new Error('subtitles.subtitle_path is required when burning subtitles.');
   }
@@ -2632,6 +2839,7 @@ export async function generateClip(requestBody) {
         audioText: subtitleRequest.audio_text,
         audioLanguage: subtitleRequest.audio_language,
         subtitleTheme: subtitleRequest.subtitle_theme,
+        subtitleDelivery: subtitleRequest.subtitle_delivery,
         highlightWords: subtitleRequest.highlight_words,
         width,
         height,
@@ -2652,6 +2860,7 @@ export async function generateClip(requestBody) {
       has_subtitles: subtitleTrack != null,
       subtitle_language: subtitleTrack?.subtitle_language,
       subtitle_theme: subtitleTrack?.subtitle_theme,
+      subtitle_delivery: subtitleTrack?.delivery,
       subtitle_highlight_words: subtitleTrack?.highlight_words,
       scene_animation: {
         image_motion_preset: sceneAnimation.image_motion_preset,
@@ -2687,10 +2896,24 @@ export async function generateClip(requestBody) {
       has_background_music: audio?.background_music_path != null,
       has_subtitles: subtitleTrack != null,
       subtitle_theme: subtitleTrack?.subtitle_theme,
+      subtitle_delivery: subtitleTrack?.delivery,
       subtitle_highlight_words: subtitleTrack?.highlight_words,
       output_filename: 'generate-clip.mp4',
       output_size_bytes: outputStats.size,
     });
+
+    const subtitleArtifacts = subtitleTrack?.delivery === 'external'
+      ? [
+          {
+            artifact_id: 'subtitle_srt',
+            kind: 'subtitle_track',
+            format: 'srt',
+            file_path: subtitleTrack.subtitle_path,
+            filename: path.basename(subtitleTrack.subtitle_path),
+            content_type: subtitleTrack.subtitle_content_type,
+          },
+        ]
+      : undefined;
 
     shouldCleanupOutputDir = false;
     return {
@@ -2706,7 +2929,9 @@ export async function generateClip(requestBody) {
       has_background_music: audio?.background_music_path != null,
       has_subtitles: subtitleTrack != null,
       subtitle_theme: subtitleTrack?.subtitle_theme ?? DEFAULT_SUBTITLE_THEME,
+      subtitle_delivery: subtitleTrack?.delivery ?? DEFAULT_SUBTITLE_DELIVERY,
       subtitle_highlight_words: subtitleTrack?.highlight_words ?? false,
+      ...(subtitleArtifacts == null ? {} : { artifacts: subtitleArtifacts }),
       scene_animation: sceneAnimation,
     };
   } finally {
@@ -2752,6 +2977,11 @@ export async function joinVideoClips(requestBody) {
       width,
       height,
       fps,
+    });
+    const mergedSubtitleArtifact = await buildMergedJoinClipsSubtitleArtifact({
+      clips,
+      durations,
+      outputDir,
     });
     const hasAudio = clipStreamInfos.some((clipInfo) => clipInfo.has_audio);
     const backgroundMusicMixRequest = requestBody.background_music_mix ?? requestBody.backgroundMusicMix;
@@ -2818,6 +3048,7 @@ export async function joinVideoClips(requestBody) {
       fps,
       has_audio: hasAudio,
       has_background_music: backgroundMusic != null,
+      has_subtitles: mergedSubtitleArtifact != null,
       output_filename: 'join-clips.mp4',
       output_size_bytes: outputStats.size,
     });
@@ -2834,8 +3065,11 @@ export async function joinVideoClips(requestBody) {
       fps,
       has_audio: hasAudio,
       has_background_music: backgroundMusic != null,
+      has_subtitles: mergedSubtitleArtifact != null,
+      ...(mergedSubtitleArtifact == null ? {} : { artifacts: [mergedSubtitleArtifact] }),
       clips: clips.map((clip) => ({
         clip_path: clip.clip_path,
+        ...(clip.subtitle_path == null ? {} : { subtitle_path: clip.subtitle_path }),
         transition_to_next: clip.transition_to_next,
       })),
     };
