@@ -73,6 +73,8 @@ def parse_args():
     parser.add_argument('--language', required=True)
     parser.add_argument('--device', default='cpu')
     parser.add_argument('--model-cache-dir')
+    parser.add_argument('--playres-x', type=int, default=1920)
+    parser.add_argument('--playres-y', type=int, default=1080)
     parser.add_argument('--max-line-width', type=int, default=42)
     parser.add_argument('--max-line-count', type=int, default=2)
     parser.add_argument('--theme', choices=sorted(SUBTITLE_THEME_PROFILES.keys()), default='default')
@@ -117,33 +119,81 @@ def format_ass_timestamp(seconds: float) -> str:
     return f'{hours}:{minutes:02d}:{whole_seconds:02d}.{centiseconds:02d}'
 
 
+def get_token_text(token) -> str:
+    if isinstance(token, dict):
+        return str(token.get('text', ''))
+    return str(token)
+
+
+def partition_tokens_into_lines(tokens, max_line_width: int, max_line_count: int):
+    if not tokens:
+        return []
+
+    normalized_tokens = list(tokens)
+    max_line_count = max(1, int(max_line_count))
+    token_texts = [get_token_text(token) for token in normalized_tokens]
+    token_count = len(normalized_tokens)
+
+    prefix_lengths = [0]
+    for token_text in token_texts:
+        prefix_lengths.append(prefix_lengths[-1] + len(token_text))
+
+    def line_length(start_index: int, end_index: int) -> int:
+        words_in_line = end_index - start_index
+        return prefix_lengths[end_index] - prefix_lengths[start_index] + max(words_in_line - 1, 0)
+
+    infinity = float('inf')
+    best_costs = [[infinity] * (max_line_count + 1) for _ in range(token_count + 1)]
+    previous_breaks = [[None] * (max_line_count + 1) for _ in range(token_count + 1)]
+    best_costs[0][0] = 0
+
+    for end_index in range(1, token_count + 1):
+        for line_count in range(1, min(max_line_count, end_index) + 1):
+            for start_index in range(line_count - 1, end_index):
+                previous_cost = best_costs[start_index][line_count - 1]
+                if previous_cost == infinity:
+                    continue
+
+                candidate_cost = max(previous_cost, line_length(start_index, end_index))
+                if candidate_cost < best_costs[end_index][line_count]:
+                    best_costs[end_index][line_count] = candidate_cost
+                    previous_breaks[end_index][line_count] = start_index
+
+    chosen_line_count = None
+    for line_count in range(1, max_line_count + 1):
+        if best_costs[token_count][line_count] <= max_line_width:
+            chosen_line_count = line_count
+            break
+
+    if chosen_line_count is None:
+        chosen_line_count = min(
+            range(1, max_line_count + 1),
+            key=lambda line_count: (best_costs[token_count][line_count], line_count),
+        )
+
+    lines = []
+    end_index = token_count
+    line_count = chosen_line_count
+
+    while line_count > 0 and end_index > 0:
+        start_index = previous_breaks[end_index][line_count]
+        if start_index is None:
+            break
+        lines.append(normalized_tokens[start_index:end_index])
+        end_index = start_index
+        line_count -= 1
+
+    lines.reverse()
+    return [line for line in lines if line]
+
+
 def wrap_subtitle_text(text: str, max_line_width: int, max_line_count: int) -> str:
     words = text.split()
     if not words:
         return text.strip()
 
-    lines = []
-    current_line = []
-
-    for word in words:
-        proposed_line = ' '.join(current_line + [word]) if current_line else word
-        if current_line and len(proposed_line) > max_line_width and len(lines) + 1 < max_line_count:
-            lines.append(' '.join(current_line))
-            current_line = [word]
-            continue
-
-        current_line.append(word)
-
-    if current_line:
-        remaining_text = ' '.join(current_line)
-        if len(lines) < max_line_count:
-            lines.append(remaining_text)
-        elif lines:
-            lines[-1] = f'{lines[-1]} {remaining_text}'.strip()
-        else:
-            lines.append(remaining_text)
-
-    return '\n'.join(lines)
+    lines = partition_tokens_into_lines(words, max_line_width, max_line_count)
+    return '\n'.join(' '.join(line) for line in lines)
 
 
 def escape_ass_text(text: str) -> str:
@@ -151,35 +201,7 @@ def escape_ass_text(text: str) -> str:
 
 
 def group_words_into_lines(words, max_line_width: int, max_line_count: int):
-    if not words:
-        return []
-
-    lines = []
-    current_line = []
-    current_length = 0
-
-    for word in words:
-        word_text = word['text']
-        proposed_length = current_length + (1 if current_line else 0) + len(word_text)
-
-        if current_line and proposed_length > max_line_width and len(lines) + 1 < max_line_count:
-            lines.append(current_line)
-            current_line = [word]
-            current_length = len(word_text)
-            continue
-
-        current_line.append(word)
-        current_length = proposed_length
-
-    if current_line:
-        if len(lines) < max_line_count:
-            lines.append(current_line)
-        elif lines:
-            lines[-1].extend(current_line)
-        else:
-            lines.append(current_line)
-
-    return lines
+    return partition_tokens_into_lines(words, max_line_width, max_line_count)
 
 
 def build_karaoke_ass_text(words, segment_end: float, max_line_width: int, max_line_count: int) -> str:
@@ -305,14 +327,14 @@ def build_ass_style_line(theme_profile) -> str:
     )
 
 
-def write_ass(output_path: str, segments, max_line_width: int, max_line_count: int, highlight_words: bool, theme_profile) -> None:
-    output = Path(output_path)
-    output.parent.mkdir(parents=True, exist_ok=True)
+def build_ass_header(play_res_x: int, play_res_y: int) -> str:
+    normalized_play_res_x = max(int(play_res_x), 1)
+    normalized_play_res_y = max(int(play_res_y), 1)
 
-    header = """[Script Info]
+    return f"""[Script Info]
 ScriptType: v4.00+
-PlayResX: 1920
-PlayResY: 1080
+PlayResX: {normalized_play_res_x}
+PlayResY: {normalized_play_res_y}
 WrapStyle: 0
 ScaledBorderAndShadow: yes
 
@@ -322,6 +344,13 @@ Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour,
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 """
+
+
+def write_ass(output_path: str, segments, max_line_width: int, max_line_count: int, highlight_words: bool, theme_profile, play_res_x: int, play_res_y: int) -> None:
+    output = Path(output_path)
+    output.parent.mkdir(parents=True, exist_ok=True)
+
+    header = build_ass_header(play_res_x, play_res_y)
 
     with output.open('w', encoding='utf-8') as handle:
         handle.write(header)
@@ -333,11 +362,11 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             )
 
 
-def write_output(output_path: str, segments, max_line_width: int, max_line_count: int, highlight_words: bool, theme_profile) -> str:
+def write_output(output_path: str, segments, max_line_width: int, max_line_count: int, highlight_words: bool, theme_profile, play_res_x: int, play_res_y: int) -> str:
     output_suffix = Path(output_path).suffix.lower()
 
     if output_suffix == '.ass':
-        write_ass(output_path, segments, max_line_width, max_line_count, highlight_words, theme_profile)
+        write_ass(output_path, segments, max_line_width, max_line_count, highlight_words, theme_profile, play_res_x, play_res_y)
         return 'ass'
 
     write_srt(output_path, segments)
@@ -404,6 +433,8 @@ def main():
         args.max_line_count,
         args.highlight_words,
         theme_profile,
+        args.playres_x,
+        args.playres_y,
     )
     print(json.dumps({
         'ok': True,
