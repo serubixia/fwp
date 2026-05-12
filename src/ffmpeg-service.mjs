@@ -1418,10 +1418,27 @@ function buildSubtitleForceStyle(subtitleTheme, width = SUBTITLE_LAYOUT_BASE_WID
     `OutlineColour=${themeProfile.outline_colour}`,
     `BackColour=${themeProfile.back_colour}`,
     `Bold=${themeProfile.bold}`,
-    'Alignment=5',
+    `Alignment=${themeProfile.alignment}`,
     `MarginL=${themeProfile.margin_l}`,
     `MarginR=${themeProfile.margin_r}`,
-    'MarginV=0',
+    `MarginV=${themeProfile.margin_v}`,
+    'BorderStyle=1',
+    'Outline=2',
+    'Shadow=0',
+  ].join(',');
+}
+
+function buildSubtitleLayoutForceStyle(subtitleTheme, width = SUBTITLE_LAYOUT_BASE_WIDTH, height = SUBTITLE_LAYOUT_BASE_HEIGHT) {
+  const themeProfile = getScaledSubtitleThemeProfile(subtitleTheme, width, height);
+
+  return [
+    `FontName=${themeProfile.font_name}`,
+    `Fontsize=${themeProfile.font_size}`,
+    `Bold=${themeProfile.bold}`,
+    `Alignment=${themeProfile.alignment}`,
+    `MarginL=${themeProfile.margin_l}`,
+    `MarginR=${themeProfile.margin_r}`,
+    `MarginV=${themeProfile.margin_v}`,
     'BorderStyle=1',
     'Outline=2',
     'Shadow=0',
@@ -1548,7 +1565,9 @@ async function createAlignedSubtitleTrack({
     subtitle_language: audioLanguage,
     subtitle_theme: subtitleTheme,
     highlight_words: highlightWords,
-    force_style: highlightWords ? null : buildSubtitleForceStyle(subtitleTheme, width, height),
+    force_style: highlightWords
+      ? buildSubtitleLayoutForceStyle(subtitleTheme, width, height)
+      : buildSubtitleForceStyle(subtitleTheme, width, height),
   };
 }
 
