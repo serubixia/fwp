@@ -1,5 +1,5 @@
 import { spawn } from 'node:child_process';
-import { createWriteStream } from 'node:fs';
+import { createWriteStream, readdirSync } from 'node:fs';
 import { mkdtemp, mkdir, rm, stat, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { Readable } from 'node:stream';
@@ -68,6 +68,18 @@ const LONG_RENDER_THRESHOLD_SECONDS = 20;
 const DEFAULT_AUDIO_CODEC = 'aac';
 const DEFAULT_AUDIO_BITRATE = '192k';
 const DEFAULT_AUDIO_SAMPLE_RATE = 48000;
+const DEFAULT_BACKGROUND_MUSIC_VOLUME = 0.18;
+const DEFAULT_BACKGROUND_MUSIC_FADE_IN_SECONDS = 0.2;
+const DEFAULT_BACKGROUND_MUSIC_FADE_OUT_SECONDS = 0.35;
+const DEFAULT_BACKGROUND_MUSIC_LOOP = true;
+const DEFAULT_BACKGROUND_MUSIC_DUCKING_ENABLED = true;
+const DEFAULT_BACKGROUND_MUSIC_DUCKING_THRESHOLD = 0.015;
+const DEFAULT_BACKGROUND_MUSIC_DUCKING_RATIO = 10;
+const DEFAULT_BACKGROUND_MUSIC_DUCKING_ATTACK_MS = 20;
+const DEFAULT_BACKGROUND_MUSIC_DUCKING_RELEASE_MS = 250;
+const BACKGROUND_MUSIC_COLLECTIONS = Object.freeze(['long-form', 'shorts']);
+const BACKGROUND_MUSIC_EXTENSIONS = Object.freeze(['.mp3', '.wav', '.m4a', '.aac', '.ogg', '.flac']);
+const DEFAULT_CHANNEL_AUDIO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..', 'channels');
 const DEFAULT_FONT_SIZE = 72;
 const DEFAULT_FONT_COLOR = 'white';
 const DEFAULT_BORDER_COLOR = 'black@0.45';
@@ -672,6 +684,126 @@ function resolveWorkspacePath(inputPath, label) {
   return resolvedPath;
 }
 
+function resolveChannelAudioRoot(value = process.env.CHANNEL_AUDIO_ROOT) {
+  if (typeof value === 'string' && value.trim().length > 0) {
+    return path.resolve(value.trim());
+  }
+
+  return DEFAULT_CHANNEL_AUDIO_ROOT;
+}
+
+function isSupportedBackgroundMusicFilename(filename) {
+  return BACKGROUND_MUSIC_EXTENSIONS.includes(path.extname(filename).toLowerCase());
+}
+
+function parseBackgroundMusicId(value, label = 'background_music_id') {
+  const normalizedValue = ensureNonEmptyString(value, label);
+  const [channelSlug, collection, filename, ...extraParts] = normalizedValue.split('/');
+
+  if (extraParts.length > 0 || !channelSlug || !collection || !filename) {
+    throw new Error(`${label} must use the format <channel_slug>/<long-form|shorts>/<filename>.`);
+  }
+
+  if (!/^[a-z0-9-]+$/.test(channelSlug)) {
+    throw new Error(`${label}.channel must contain only lowercase letters, digits and hyphens.`);
+  }
+
+  ensureEnum(collection, BACKGROUND_MUSIC_COLLECTIONS, `${label}.collection`);
+
+  if (
+    filename.startsWith('.')
+    || filename.includes('/')
+    || filename.includes('\\')
+    || !/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(filename)
+  ) {
+    throw new Error(`${label}.filename must be a safe file name.`);
+  }
+
+  if (!isSupportedBackgroundMusicFilename(filename)) {
+    throw new Error(`${label}.filename must use one of: ${BACKGROUND_MUSIC_EXTENSIONS.join(', ')}.`);
+  }
+
+  return {
+    id: `${channelSlug}/${collection}/${filename}`,
+    channel_slug: channelSlug,
+    collection,
+    filename,
+  };
+}
+
+function resolveBackgroundMusicCollectionRoot(channelSlug, collection) {
+  return path.join(resolveChannelAudioRoot(), channelSlug, 'audio', collection);
+}
+
+function resolveBundledBackgroundMusicPath(value, label = 'background_music_id') {
+  const parsedId = parseBackgroundMusicId(value, label);
+  const collectionRoot = resolveBackgroundMusicCollectionRoot(parsedId.channel_slug, parsedId.collection);
+  const resolvedPath = path.resolve(collectionRoot, parsedId.filename);
+  const relativePath = path.relative(collectionRoot, resolvedPath);
+
+  if (relativePath.startsWith('..') || path.isAbsolute(relativePath)) {
+    throw new Error(`${label} must stay inside the bundled channel audio library.`);
+  }
+
+  try {
+    const trackEntry = readdirSync(collectionRoot, { withFileTypes: true })
+      .find((entry) => entry.isFile() && entry.name === parsedId.filename);
+
+    if (trackEntry == null) {
+      throw new Error(`${label} does not match any bundled background music track: ${parsedId.id}.`);
+    }
+  } catch (error) {
+    if (error instanceof Error && error.message.includes('does not match any bundled background music track')) {
+      throw error;
+    }
+
+    throw new Error(`${label} does not match any bundled background music track: ${parsedId.id}.`);
+  }
+
+  return {
+    ...parsedId,
+    path: resolvedPath,
+  };
+}
+
+function listBundledBackgroundMusicEntries(channelSlug, collection) {
+  const collectionRoot = resolveBackgroundMusicCollectionRoot(channelSlug, collection);
+
+  try {
+    return readdirSync(collectionRoot, { withFileTypes: true })
+      .filter((entry) => entry.isFile() && isSupportedBackgroundMusicFilename(entry.name))
+      .map((entry) => ({
+        id: `${channelSlug}/${collection}/${entry.name}`,
+        filename: entry.name,
+      }))
+      .sort((leftEntry, rightEntry) => leftEntry.id.localeCompare(rightEntry.id));
+  } catch {
+    return [];
+  }
+}
+
+function buildBundledBackgroundMusicCatalog() {
+  const channelAudioRoot = resolveChannelAudioRoot();
+
+  try {
+    return Object.fromEntries(
+      readdirSync(channelAudioRoot, { withFileTypes: true })
+        .filter((entry) => entry.isDirectory())
+        .map((entry) => [
+          entry.name,
+          Object.fromEntries(
+            BACKGROUND_MUSIC_COLLECTIONS.map((collection) => [
+              collection,
+              listBundledBackgroundMusicEntries(entry.name, collection),
+            ])
+          ),
+        ])
+    );
+  } catch {
+    return {};
+  }
+}
+
 export function validateSceneAnimation(sceneAnimation, label = 'scene_animation') {
   if (!sceneAnimation || typeof sceneAnimation !== 'object') {
     throw new Error(`${label} must be an object.`);
@@ -1108,6 +1240,16 @@ function normalizeJoinClipsRequestEntry(clip, index) {
   };
 }
 
+function normalizeJoinClipsBackgroundMusicRequest(requestBody) {
+  const backgroundMusicId = requestBody.background_music_id ?? requestBody.backgroundMusicId;
+
+  return {
+    background_music_id: backgroundMusicId == null
+      ? null
+      : ensureNonEmptyString(backgroundMusicId, 'background_music_id'),
+  };
+}
+
 export function buildJoinClipsFilterGraph({
   clips,
   durations,
@@ -1179,6 +1321,7 @@ export function buildJoinClipsAudioFilterGraph({
   durations,
   audioTracks,
   audioSampleRate = DEFAULT_AUDIO_SAMPLE_RATE,
+  backgroundMusic = null,
 }) {
   if (!Array.isArray(clips) || clips.length === 0) {
     throw new Error('clips must be a non-empty array.');
@@ -1197,6 +1340,7 @@ export function buildJoinClipsAudioFilterGraph({
   const normalizedAudioSampleRate = normalizePositiveInteger(audioSampleRate, DEFAULT_AUDIO_SAMPLE_RATE, 'audio_sample_rate');
   const filterParts = [];
   const inputLabels = [];
+  const hasSceneAudio = audioTracks.some(Boolean);
   let totalDurationSeconds = 0;
 
   normalizedClips.forEach((clip, index) => {
@@ -1211,28 +1355,63 @@ export function buildJoinClipsAudioFilterGraph({
     const normalizedSegmentDuration = formatNumber(segmentDuration, 3);
     const outputLabel = `a${index}`;
 
-    if (audioTracks[index]) {
-      filterParts.push(
-        `[${index}:a]aresample=${normalizedAudioSampleRate},aformat=sample_rates=${normalizedAudioSampleRate}:channel_layouts=stereo,apad=whole_dur=${normalizedSegmentDuration},atrim=duration=${normalizedSegmentDuration},asetpts=PTS-STARTPTS[${outputLabel}]`
-      );
-    } else {
-      filterParts.push(
-        `anullsrc=r=${normalizedAudioSampleRate}:cl=stereo,atrim=duration=${normalizedSegmentDuration},asetpts=PTS-STARTPTS[${outputLabel}]`
-      );
+    if (hasSceneAudio) {
+      if (audioTracks[index]) {
+        filterParts.push(
+          `[${index}:a]aresample=${normalizedAudioSampleRate},aformat=sample_rates=${normalizedAudioSampleRate}:channel_layouts=stereo,apad=whole_dur=${normalizedSegmentDuration},atrim=duration=${normalizedSegmentDuration},asetpts=PTS-STARTPTS[${outputLabel}]`
+        );
+      } else {
+        filterParts.push(
+          `anullsrc=r=${normalizedAudioSampleRate}:cl=stereo,atrim=duration=${normalizedSegmentDuration},asetpts=PTS-STARTPTS[${outputLabel}]`
+        );
+      }
+
+      inputLabels.push(`[${outputLabel}]`);
     }
 
-    inputLabels.push(`[${outputLabel}]`);
     totalDurationSeconds += segmentDuration;
   });
 
-  if (inputLabels.length > 1) {
-    filterParts.push(`${inputLabels.join('')}concat=n=${inputLabels.length}:v=0:a=1[aout]`);
+  const normalizedTotalDurationSeconds = Number(formatNumber(totalDurationSeconds, 3));
+  const sceneAudioLabel = hasSceneAudio
+    ? (inputLabels.length > 1 ? 'ascenes' : 'a0')
+    : null;
+
+  if (hasSceneAudio && inputLabels.length > 1) {
+    filterParts.push(`${inputLabels.join('')}concat=n=${inputLabels.length}:v=0:a=1[ascenes]`);
+  }
+
+  if (backgroundMusic != null) {
+    filterParts.push(buildPreparedAudioStreamFilter({
+      inputIndex: normalizedClips.length,
+      audioSampleRate: normalizedAudioSampleRate,
+      durationSeconds: normalizedTotalDurationSeconds,
+      volume: backgroundMusic.mix.volume,
+      fadeInSeconds: backgroundMusic.mix.fade_in_seconds,
+      fadeOutSeconds: backgroundMusic.mix.fade_out_seconds,
+      outputLabel: sceneAudioLabel == null ? 'aout' : 'abg',
+    }));
+
+    if (sceneAudioLabel != null) {
+      let musicLabel = 'abg';
+
+      if (backgroundMusic.mix.ducking_enabled) {
+        filterParts.push(
+          `[abg][${sceneAudioLabel}]sidechaincompress=threshold=${formatNumber(DEFAULT_BACKGROUND_MUSIC_DUCKING_THRESHOLD, 3)}:ratio=${formatNumber(DEFAULT_BACKGROUND_MUSIC_DUCKING_RATIO, 3)}:attack=${DEFAULT_BACKGROUND_MUSIC_DUCKING_ATTACK_MS}:release=${DEFAULT_BACKGROUND_MUSIC_DUCKING_RELEASE_MS}[abgduck]`
+        );
+        musicLabel = 'abgduck';
+      }
+
+      filterParts.push(
+        `[${musicLabel}][${sceneAudioLabel}]amix=inputs=2:duration=first:dropout_transition=0:normalize=0[aout]`
+      );
+    }
   }
 
   return {
     filterGraph: filterParts.join(';'),
-    outputLabel: inputLabels.length > 1 ? 'aout' : 'a0',
-    totalDurationSeconds: Number(formatNumber(totalDurationSeconds, 3)),
+    outputLabel: backgroundMusic != null ? 'aout' : sceneAudioLabel,
+    totalDurationSeconds: normalizedTotalDurationSeconds,
   };
 }
 
@@ -1337,6 +1516,92 @@ function normalizeVoiceoverMix(voiceoverMix, durationSeconds) {
   return {
     volume: Number(formatNumber(volume, 3)),
     fade_out_seconds: Number(formatNumber(fadeOutSeconds, 3)),
+  };
+}
+
+function resolveDefaultAudioFadeSeconds(defaultSeconds, durationSeconds) {
+  return Number(formatNumber(
+    Math.min(defaultSeconds, Math.max(Number(durationSeconds) - 0.05, 0)),
+    3,
+  ));
+}
+
+function normalizeBackgroundMusicMix(backgroundMusicMix, durationSeconds) {
+  const defaultFadeInSeconds = resolveDefaultAudioFadeSeconds(
+    DEFAULT_BACKGROUND_MUSIC_FADE_IN_SECONDS,
+    durationSeconds,
+  );
+  const defaultFadeOutSeconds = resolveDefaultAudioFadeSeconds(
+    DEFAULT_BACKGROUND_MUSIC_FADE_OUT_SECONDS,
+    durationSeconds,
+  );
+
+  if (backgroundMusicMix == null) {
+    return {
+      volume: DEFAULT_BACKGROUND_MUSIC_VOLUME,
+      fade_in_seconds: defaultFadeInSeconds,
+      fade_out_seconds: defaultFadeOutSeconds,
+      loop: DEFAULT_BACKGROUND_MUSIC_LOOP,
+      ducking_enabled: DEFAULT_BACKGROUND_MUSIC_DUCKING_ENABLED,
+    };
+  }
+
+  if (typeof backgroundMusicMix !== 'object') {
+    throw new Error('background_music_mix must be an object.');
+  }
+
+  const volume = normalizePositiveNumber(
+    backgroundMusicMix.volume,
+    DEFAULT_BACKGROUND_MUSIC_VOLUME,
+    'background_music_mix.volume'
+  );
+  const fadeInSeconds = normalizeNonNegativeNumber(
+    backgroundMusicMix.fade_in_seconds ?? backgroundMusicMix.fadeInSeconds,
+    defaultFadeInSeconds,
+    'background_music_mix.fade_in_seconds'
+  );
+  const fadeOutSeconds = normalizeNonNegativeNumber(
+    backgroundMusicMix.fade_out_seconds ?? backgroundMusicMix.fadeOutSeconds,
+    defaultFadeOutSeconds,
+    'background_music_mix.fade_out_seconds'
+  );
+  const loop = normalizeOptionalBoolean(
+    backgroundMusicMix.loop,
+    DEFAULT_BACKGROUND_MUSIC_LOOP,
+    'background_music_mix.loop'
+  );
+  const duckingEnabled = normalizeOptionalBoolean(
+    backgroundMusicMix.ducking_enabled ?? backgroundMusicMix.duckingEnabled,
+    DEFAULT_BACKGROUND_MUSIC_DUCKING_ENABLED,
+    'background_music_mix.ducking_enabled'
+  );
+
+  if (volume > 1) {
+    throw new Error('background_music_mix.volume must stay at or below 1.');
+  }
+
+  if (fadeInSeconds > 5) {
+    throw new Error('background_music_mix.fade_in_seconds must stay at or below 5.');
+  }
+
+  if (fadeOutSeconds > 5) {
+    throw new Error('background_music_mix.fade_out_seconds must stay at or below 5.');
+  }
+
+  if (fadeInSeconds >= durationSeconds) {
+    throw new Error('background_music_mix.fade_in_seconds must be shorter than duration_seconds.');
+  }
+
+  if (fadeOutSeconds >= durationSeconds) {
+    throw new Error('background_music_mix.fade_out_seconds must be shorter than duration_seconds.');
+  }
+
+  return {
+    volume: Number(formatNumber(volume, 3)),
+    fade_in_seconds: Number(formatNumber(fadeInSeconds, 3)),
+    fade_out_seconds: Number(formatNumber(fadeOutSeconds, 3)),
+    loop,
+    ducking_enabled: duckingEnabled,
   };
 }
 
@@ -1479,7 +1744,7 @@ function normalizeGenerateClipSubtitleRequest(requestBody, audio) {
     return null;
   }
 
-  if (audio == null) {
+  if (audio?.voiceover_path == null) {
     throw new Error('audio_text requires voiceover_binary.');
   }
 
@@ -1812,7 +2077,8 @@ export async function materializeGenerateClipBinaryInputs(requestBody, tempRoot 
     return null;
   }
 
-  const needsTempDir = [imageBinary, voiceoverBinary].some((upload) => upload != null && !hasDirectUploadFilePath(upload));
+  const needsTempDir = [imageBinary, voiceoverBinary]
+    .some((upload) => upload != null && !hasDirectUploadFilePath(upload));
   const storageReservation = needsTempDir
     ? await reserveManagedStorageBytes({
       storageRoot: tempRoot,
@@ -1915,6 +2181,7 @@ export async function materializeJoinClipsInputs(requestBody, tempRoot = resolve
   }
 
   const normalizedClipEntries = requestBody.clips.map((clip, index) => normalizeJoinClipsRequestEntry(clip, index));
+  const backgroundMusicRequest = normalizeJoinClipsBackgroundMusicRequest(requestBody);
   const needsTempDir = normalizedClipEntries.some(
     (clip) => clip.clip_binary != null && !hasDirectUploadFilePath(clip.clip_binary)
   );
@@ -1950,6 +2217,10 @@ export async function materializeJoinClipsInputs(requestBody, tempRoot = resolve
           : await writeBinaryUploadToTempFile(clip.clip_binary, tempDir, `clip-${String(index + 1).padStart(2, '0')}`, '.mp4'),
         transition_to_next: clip.transition_to_next,
       }))),
+      background_music_id: backgroundMusicRequest.background_music_id,
+      background_music_path: backgroundMusicRequest.background_music_id == null
+          ? null
+          : resolveBundledBackgroundMusicPath(backgroundMusicRequest.background_music_id, 'background_music_id').path,
       cleanup: async () => {
         if (tempDir != null) {
           await rm(tempDir, { recursive: true, force: true });
@@ -1999,17 +2270,126 @@ export async function probeAudioDuration(requestBody) {
 
 function normalizeGenerateClipAudio(requestBody, durationSeconds, materializedInputs) {
   const materializedVoiceoverPath = materializedInputs?.voiceover_path ?? null;
+  const backgroundMusicId = requestBody.background_music_id ?? requestBody.backgroundMusicId;
+  const materializedBackgroundMusicPath = backgroundMusicId == null
+    ? null
+    : resolveBundledBackgroundMusicPath(backgroundMusicId, 'background_music_id').path;
+  const backgroundMusicMix = requestBody.background_music_mix ?? requestBody.backgroundMusicMix;
 
-  if (materializedVoiceoverPath == null) {
+  if (backgroundMusicMix != null && materializedBackgroundMusicPath == null) {
+    throw new Error('background_music_mix requires background_music_id.');
+  }
+
+  if (materializedVoiceoverPath == null && materializedBackgroundMusicPath == null) {
     return null;
   }
 
   return {
     voiceover_path: materializedVoiceoverPath,
-    voiceover_mix: normalizeVoiceoverMix(requestBody.voiceover_mix ?? requestBody.voiceoverMix, durationSeconds),
+    voiceover_mix: materializedVoiceoverPath == null
+      ? null
+      : normalizeVoiceoverMix(requestBody.voiceover_mix ?? requestBody.voiceoverMix, durationSeconds),
+    background_music_path: materializedBackgroundMusicPath,
+    background_music_mix: materializedBackgroundMusicPath == null
+      ? null
+      : normalizeBackgroundMusicMix(backgroundMusicMix, durationSeconds),
     audio_codec: normalizeAudioCodec(requestBody.audio_codec ?? requestBody.audioCodec),
     audio_bitrate: normalizeAudioBitrate(requestBody.audio_bitrate ?? requestBody.audioBitrate),
     audio_sample_rate: normalizeAudioSampleRate(requestBody.audio_sample_rate ?? requestBody.audioSampleRate),
+  };
+}
+
+function buildPreparedAudioStreamFilter({
+  inputIndex,
+  audioSampleRate,
+  durationSeconds,
+  volume,
+  fadeInSeconds = 0,
+  fadeOutSeconds = 0,
+  outputLabel,
+}) {
+  const filterParts = [
+    `[${inputIndex}:a]aresample=${audioSampleRate}`,
+    `aformat=sample_rates=${audioSampleRate}:channel_layouts=stereo`,
+    `apad=whole_dur=${formatNumber(durationSeconds, 3)}`,
+    `atrim=duration=${formatNumber(durationSeconds, 3)}`,
+    'asetpts=PTS-STARTPTS',
+  ];
+
+  if (fadeInSeconds > 0) {
+    filterParts.push(`afade=t=in:st=0:d=${formatNumber(fadeInSeconds, 3)}`);
+  }
+
+  filterParts.push(`volume=${formatNumber(volume, 3)}`);
+
+  if (fadeOutSeconds > 0) {
+    filterParts.push(
+      `afade=t=out:st=${formatNumber(durationSeconds - fadeOutSeconds, 3)}:d=${formatNumber(fadeOutSeconds, 3)}`
+    );
+  }
+
+  return `${filterParts.join(',')}[${outputLabel}]`;
+}
+
+function buildGenerateClipAudioFilterGraph({
+  audio,
+  durationSeconds,
+  voiceoverInputIndex,
+  backgroundMusicInputIndex,
+}) {
+  if (audio == null) {
+    return null;
+  }
+
+  const filterParts = [];
+  const hasVoiceover = voiceoverInputIndex != null;
+  const hasBackgroundMusic = backgroundMusicInputIndex != null;
+
+  if (hasVoiceover) {
+    filterParts.push(buildPreparedAudioStreamFilter({
+      inputIndex: voiceoverInputIndex,
+      audioSampleRate: audio.audio_sample_rate,
+      durationSeconds,
+      volume: audio.voiceover_mix.volume,
+      fadeOutSeconds: audio.voiceover_mix.fade_out_seconds,
+      outputLabel: hasBackgroundMusic ? 'avoice' : 'aout',
+    }));
+  }
+
+  if (hasBackgroundMusic) {
+    filterParts.push(buildPreparedAudioStreamFilter({
+      inputIndex: backgroundMusicInputIndex,
+      audioSampleRate: audio.audio_sample_rate,
+      durationSeconds,
+      volume: audio.background_music_mix.volume,
+      fadeInSeconds: audio.background_music_mix.fade_in_seconds,
+      fadeOutSeconds: audio.background_music_mix.fade_out_seconds,
+      outputLabel: hasVoiceover ? 'abg' : 'aout',
+    }));
+  }
+
+  if (hasVoiceover && hasBackgroundMusic) {
+    let musicLabel = 'abg';
+
+    if (audio.background_music_mix.ducking_enabled) {
+      filterParts.push(
+        `[abg][avoice]sidechaincompress=threshold=${formatNumber(DEFAULT_BACKGROUND_MUSIC_DUCKING_THRESHOLD, 3)}:ratio=${formatNumber(DEFAULT_BACKGROUND_MUSIC_DUCKING_RATIO, 3)}:attack=${DEFAULT_BACKGROUND_MUSIC_DUCKING_ATTACK_MS}:release=${DEFAULT_BACKGROUND_MUSIC_DUCKING_RELEASE_MS}[abgduck]`
+      );
+      musicLabel = 'abgduck';
+    }
+
+    filterParts.push(
+      `[${musicLabel}][avoice]amix=inputs=2:duration=first:dropout_transition=0:normalize=0[aout]`
+    );
+  }
+
+  if (filterParts.length === 0) {
+    return null;
+  }
+
+  return {
+    filterGraph: filterParts.join(';'),
+    outputLabel: 'aout',
   };
 }
 
@@ -2031,40 +2411,49 @@ export function buildGenerateClipFfmpegArgs({
     imagePath,
   ];
 
-  if (audio) {
+  let voiceoverInputIndex = null;
+  let backgroundMusicInputIndex = null;
+
+  if (audio?.voiceover_path) {
+    voiceoverInputIndex = 1;
     args.push(
       '-i',
       audio.voiceover_path,
     );
   }
 
+  if (audio?.background_music_path) {
+    backgroundMusicInputIndex = voiceoverInputIndex == null ? 1 : 2;
+    if (audio.background_music_mix.loop) {
+      args.push('-stream_loop', '-1');
+    }
+    args.push(
+      '-i',
+      audio.background_music_path,
+    );
+  }
+
+  const audioFilterGraph = buildGenerateClipAudioFilterGraph({
+    audio,
+    durationSeconds,
+    voiceoverInputIndex,
+    backgroundMusicInputIndex,
+  });
+  const combinedFilterGraph = audioFilterGraph == null
+    ? filterGraph
+    : `${filterGraph};${audioFilterGraph.filterGraph}`;
+
   args.push(
     '-filter_complex',
-    filterGraph,
+    combinedFilterGraph,
     '-map',
     `[${videoOutputLabel}]`
   );
 
-  if (audio) {
-    const voiceoverFilterParts = [
-      `[1:a]aresample=${audio.audio_sample_rate}`,
-      `apad=whole_dur=${formatNumber(durationSeconds, 3)}`,
-      `atrim=duration=${formatNumber(durationSeconds, 3)}`,
-      'asetpts=PTS-STARTPTS',
-      `volume=${formatNumber(audio.voiceover_mix.volume, 3)}`,
-    ];
-
-    if (audio.voiceover_mix.fade_out_seconds > 0) {
-      voiceoverFilterParts.push(
-        `afade=t=out:st=${formatNumber(durationSeconds - audio.voiceover_mix.fade_out_seconds, 3)}:d=${formatNumber(audio.voiceover_mix.fade_out_seconds, 3)}`
-      );
-    }
-
+  if (audioFilterGraph != null) {
     args.push(
-      '-filter:a',
-      voiceoverFilterParts.join(','),
       '-map',
-      '1:a:0',
+      `[${audioFilterGraph.outputLabel}]`,
       '-c:a',
       audio.audio_codec,
       '-b:a',
@@ -2133,11 +2522,22 @@ export function buildJoinClipsFfmpegArgs({
   const args = [
     '-y',
     ...clips.flatMap((clip) => ['-i', clip.clip_path]),
+  ];
+
+  if (audio?.background_music_path) {
+    if (audio.background_music_mix?.loop) {
+      args.push('-stream_loop', '-1');
+    }
+
+    args.push('-i', audio.background_music_path);
+  }
+
+  args.push(
     '-filter_complex',
     filterGraph,
     '-map',
     `[${outputLabel}]`,
-  ];
+  );
 
   if (audio) {
     args.push(
@@ -2239,7 +2639,8 @@ export async function generateClip(requestBody) {
       width,
       height,
       fps,
-      has_voiceover: audio != null,
+      has_voiceover: audio?.voiceover_path != null,
+      has_background_music: audio?.background_music_path != null,
       has_subtitles: subtitleTrack != null,
       subtitle_language: subtitleTrack?.subtitle_language,
       subtitle_theme: subtitleTrack?.subtitle_theme,
@@ -2274,7 +2675,8 @@ export async function generateClip(requestBody) {
       width,
       height,
       fps,
-      has_voiceover: audio != null,
+      has_voiceover: audio?.voiceover_path != null,
+      has_background_music: audio?.background_music_path != null,
       has_subtitles: subtitleTrack != null,
       subtitle_theme: subtitleTrack?.subtitle_theme,
       subtitle_highlight_words: subtitleTrack?.highlight_words,
@@ -2292,7 +2694,8 @@ export async function generateClip(requestBody) {
       width,
       height,
       fps,
-      has_voiceover: audio != null,
+      has_voiceover: audio?.voiceover_path != null,
+      has_background_music: audio?.background_music_path != null,
       has_subtitles: subtitleTrack != null,
       subtitle_theme: subtitleTrack?.subtitle_theme ?? DEFAULT_SUBTITLE_THEME,
       subtitle_highlight_words: subtitleTrack?.highlight_words ?? false,
@@ -2343,11 +2746,27 @@ export async function joinVideoClips(requestBody) {
       fps,
     });
     const hasAudio = clipStreamInfos.some((clipInfo) => clipInfo.has_audio);
-    const audioGraph = hasAudio
+    const backgroundMusicMixRequest = requestBody.background_music_mix ?? requestBody.backgroundMusicMix;
+
+    if (backgroundMusicMixRequest != null && materializedInputs.background_music_path == null) {
+      throw new Error('background_music_mix requires background_music_id.');
+    }
+
+    const backgroundMusic = materializedInputs.background_music_path == null
+      ? null
+      : {
+        path: materializedInputs.background_music_path,
+        mix: normalizeBackgroundMusicMix(
+          backgroundMusicMixRequest,
+          totalDurationSeconds,
+        ),
+      };
+    const audioGraph = hasAudio || backgroundMusic != null
       ? buildJoinClipsAudioFilterGraph({
         clips,
         durations,
         audioTracks: clipStreamInfos.map((clipInfo) => clipInfo.has_audio),
+        backgroundMusic,
       })
       : null;
 
@@ -2356,6 +2775,7 @@ export async function joinVideoClips(requestBody) {
       video_durations_seconds: durations.map((duration) => Number(formatNumber(duration, 3))),
       audio_tracks: clipStreamInfos.map((clipInfo) => clipInfo.has_audio),
       has_audio: hasAudio,
+      has_background_music: backgroundMusic != null,
     });
 
     const encodePreset = getAdaptiveEncodePreset(requestBody.encode_preset ?? requestBody.encodePreset, totalDurationSeconds);
@@ -2375,6 +2795,8 @@ export async function joinVideoClips(requestBody) {
         audio_codec: DEFAULT_AUDIO_CODEC,
         audio_bitrate: DEFAULT_AUDIO_BITRATE,
         audio_sample_rate: DEFAULT_AUDIO_SAMPLE_RATE,
+        background_music_path: backgroundMusic?.path,
+        background_music_mix: backgroundMusic?.mix,
       },
     }));
 
@@ -2387,6 +2809,7 @@ export async function joinVideoClips(requestBody) {
       height,
       fps,
       has_audio: hasAudio,
+      has_background_music: backgroundMusic != null,
       output_filename: 'join-clips.mp4',
       output_size_bytes: outputStats.size,
     });
@@ -2402,6 +2825,7 @@ export async function joinVideoClips(requestBody) {
       height,
       fps,
       has_audio: hasAudio,
+      has_background_music: backgroundMusic != null,
       clips: clips.map((clip) => ({
         clip_path: clip.clip_path,
         transition_to_next: clip.transition_to_next,
@@ -2465,6 +2889,10 @@ export function getPresetCatalog() {
         zoom_in: 'Paso con ligera aproximacion.',
       },
       max_duration_seconds: 1.2,
+    },
+    background_music: {
+      id_format: '<channel_slug>/<long-form|shorts>/<filename>',
+      channels: buildBundledBackgroundMusicCatalog(),
     },
   };
 }
