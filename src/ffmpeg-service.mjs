@@ -1394,16 +1394,21 @@ export function buildJoinClipsAudioFilterGraph({
 
     if (sceneAudioLabel != null) {
       let musicLabel = 'abg';
+      let mixSceneAudioLabel = sceneAudioLabel;
 
       if (backgroundMusic.mix.ducking_enabled) {
         filterParts.push(
-          `[abg][${sceneAudioLabel}]sidechaincompress=threshold=${formatNumber(DEFAULT_BACKGROUND_MUSIC_DUCKING_THRESHOLD, 3)}:ratio=${formatNumber(DEFAULT_BACKGROUND_MUSIC_DUCKING_RATIO, 3)}:attack=${DEFAULT_BACKGROUND_MUSIC_DUCKING_ATTACK_MS}:release=${DEFAULT_BACKGROUND_MUSIC_DUCKING_RELEASE_MS}[abgduck]`
+          `[${sceneAudioLabel}]asplit=2[ascenesduck][ascenesmix]`
+        );
+        filterParts.push(
+          `[abg][ascenesduck]sidechaincompress=threshold=${formatNumber(DEFAULT_BACKGROUND_MUSIC_DUCKING_THRESHOLD, 3)}:ratio=${formatNumber(DEFAULT_BACKGROUND_MUSIC_DUCKING_RATIO, 3)}:attack=${DEFAULT_BACKGROUND_MUSIC_DUCKING_ATTACK_MS}:release=${DEFAULT_BACKGROUND_MUSIC_DUCKING_RELEASE_MS}[abgduck]`
         );
         musicLabel = 'abgduck';
+        mixSceneAudioLabel = 'ascenesmix';
       }
 
       filterParts.push(
-        `[${musicLabel}][${sceneAudioLabel}]amix=inputs=2:duration=first:dropout_transition=0:normalize=0[aout]`
+        `[${musicLabel}][${mixSceneAudioLabel}]amix=inputs=2:duration=first:dropout_transition=0:normalize=0[aout]`
       );
     }
   }
@@ -2370,16 +2375,19 @@ function buildGenerateClipAudioFilterGraph({
 
   if (hasVoiceover && hasBackgroundMusic) {
     let musicLabel = 'abg';
+    let mixVoiceLabel = 'avoice';
 
     if (audio.background_music_mix.ducking_enabled) {
+      filterParts.push('[avoice]asplit=2[avoiceduck][avoicemix]');
       filterParts.push(
-        `[abg][avoice]sidechaincompress=threshold=${formatNumber(DEFAULT_BACKGROUND_MUSIC_DUCKING_THRESHOLD, 3)}:ratio=${formatNumber(DEFAULT_BACKGROUND_MUSIC_DUCKING_RATIO, 3)}:attack=${DEFAULT_BACKGROUND_MUSIC_DUCKING_ATTACK_MS}:release=${DEFAULT_BACKGROUND_MUSIC_DUCKING_RELEASE_MS}[abgduck]`
+        `[abg][avoiceduck]sidechaincompress=threshold=${formatNumber(DEFAULT_BACKGROUND_MUSIC_DUCKING_THRESHOLD, 3)}:ratio=${formatNumber(DEFAULT_BACKGROUND_MUSIC_DUCKING_RATIO, 3)}:attack=${DEFAULT_BACKGROUND_MUSIC_DUCKING_ATTACK_MS}:release=${DEFAULT_BACKGROUND_MUSIC_DUCKING_RELEASE_MS}[abgduck]`
       );
       musicLabel = 'abgduck';
+      mixVoiceLabel = 'avoicemix';
     }
 
     filterParts.push(
-      `[${musicLabel}][avoice]amix=inputs=2:duration=first:dropout_transition=0:normalize=0[aout]`
+      `[${musicLabel}][${mixVoiceLabel}]amix=inputs=2:duration=first:dropout_transition=0:normalize=0[aout]`
     );
   }
 
