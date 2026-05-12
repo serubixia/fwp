@@ -1025,7 +1025,7 @@ export function buildImageTextSceneFilterGraph({
   borderColor = DEFAULT_BORDER_COLOR,
 }) {
   const normalizedSceneAnimation = validateSceneAnimation(sceneAnimation);
-  const normalizedOverlayText = ensureNonEmptyString(overlayText, 'overlay_text');
+  const normalizedOverlayText = normalizeNullableString(overlayText, 'overlay_text');
   const normalizedWidth = normalizePositiveInteger(width, DEFAULT_WIDTH, 'width');
   const normalizedHeight = normalizePositiveInteger(height, DEFAULT_HEIGHT, 'height');
   const normalizedFps = normalizePositiveInteger(fps, DEFAULT_FPS, 'fps');
@@ -1048,6 +1048,10 @@ export function buildImageTextSceneFilterGraph({
     `zoompan=z='${escapeExpression(imageMotion.z)}':x='${escapeExpression(imageMotion.x)}':y='${escapeExpression(imageMotion.y)}':d=${totalFrames}:s=${normalizedWidth}x${normalizedHeight}:fps=${normalizedFps}`,
     `tmix=frames=2:weights='1 1'[img]`,
   ].join(',');
+
+  if (normalizedOverlayText == null) {
+    return `${imageChain};[img]format=yuv420p[vout]`;
+  }
 
   const textChain = [
     `[img]drawtext=fontfile='${escapeFilterLiteral(fontFile)}':text='${escapeDrawtextText(normalizedOverlayText)}':fontcolor=${fontColor}:fontsize=${normalizedFontSize}:x='${escapeExpression(textMotion.x)}':y='${escapeExpression(textMotion.y)}':alpha='${escapeExpression(textMotion.alpha)}':borderw=4:bordercolor=${borderColor}:shadowcolor=black@0.85:shadowx=2:shadowy=2:line_spacing=8`,
@@ -1441,6 +1445,8 @@ async function createAlignedSubtitleTrack({
   audioLanguage,
   subtitleTheme,
   highlightWords = false,
+  width,
+  height,
   outputDir,
 }) {
   const transcriptPath = path.join(outputDir, 'voiceover-transcript.txt');
@@ -1457,6 +1463,10 @@ async function createAlignedSubtitleTrack({
     audioLanguage,
     '--device',
     resolveWhisperxDevice(),
+    '--playres-x',
+    String(normalizePositiveInteger(width, DEFAULT_WIDTH, 'width')),
+    '--playres-y',
+    String(normalizePositiveInteger(height, DEFAULT_HEIGHT, 'height')),
     '--theme',
     subtitleTheme,
   ];
@@ -2104,7 +2114,7 @@ export async function generateClip(requestBody) {
     outputDir = await mkdtemp(path.join(resolveManagedStorageRoot(), GENERATE_CLIP_UPLOAD_DIR_PREFIX));
     shouldCleanupOutputDir = true;
     const outputPath = path.join(outputDir, 'generate-clip.mp4');
-    const overlayText = ensureNonEmptyString(requestBody.overlay_text ?? requestBody.overlayText, 'overlay_text');
+    const overlayText = normalizeNullableString(requestBody.overlay_text ?? requestBody.overlayText, 'overlay_text');
     const durationSeconds = getGenerateClipDurationSeconds(requestBody);
     const width = normalizePositiveInteger(requestBody.width, DEFAULT_WIDTH, 'width');
     const height = normalizePositiveInteger(requestBody.height, DEFAULT_HEIGHT, 'height');
@@ -2139,6 +2149,8 @@ export async function generateClip(requestBody) {
         audioLanguage: subtitleRequest.audio_language,
         subtitleTheme: subtitleRequest.subtitle_theme,
         highlightWords: subtitleRequest.highlight_words,
+        width,
+        height,
         outputDir,
       });
     const { filterGraph, videoOutputLabel } = buildGenerateClipVideoFilterGraph({
