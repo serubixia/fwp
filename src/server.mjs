@@ -379,12 +379,23 @@ function summarizeGenerateClipPayload(payload) {
     fps: payload.fps,
     image_binary: summarizeBinaryField(payload.image_binary),
     voiceover_binary: summarizeBinaryField(payload.voiceover_binary),
+    background_music_id: payload.background_music_id,
     has_voiceover: payload.voiceover_binary != null,
+    has_background_music: payload.background_music_id != null,
     has_audio_text: typeof payload.audio_text === 'string',
     audio_text_length: payload.audio_text?.length,
     audio_language: payload.audio_language,
     subtitle_theme: payload.subtitle_theme,
     subtitle_highlight_words: payload.subtitle_highlight_words,
+    background_music_mix: payload.background_music_mix == null
+      ? undefined
+      : {
+        volume: payload.background_music_mix.volume,
+        fade_in_seconds: payload.background_music_mix.fade_in_seconds,
+        fade_out_seconds: payload.background_music_mix.fade_out_seconds,
+        loop: payload.background_music_mix.loop,
+        ducking_enabled: payload.background_music_mix.ducking_enabled,
+      },
     overlay_text_length: payload.overlay_text?.length,
     scene_animation: payload.scene_animation == null
       ? undefined
@@ -403,6 +414,16 @@ function summarizeJoinClipsPayload(payload) {
     width: payload.width,
     height: payload.height,
     fps: payload.fps,
+    background_music_id: payload.background_music_id,
+    background_music_mix: payload.background_music_mix == null
+      ? undefined
+      : {
+        volume: payload.background_music_mix.volume,
+        fade_in_seconds: payload.background_music_mix.fade_in_seconds,
+        fade_out_seconds: payload.background_music_mix.fade_out_seconds,
+        loop: payload.background_music_mix.loop,
+        ducking_enabled: payload.background_music_mix.ducking_enabled,
+      },
     clips: Array.isArray(payload.clips)
       ? payload.clips.map((clip) => ({
         clip_path: clip.clip_path,
@@ -1490,6 +1511,8 @@ async function readGenerateClipMultipartBody(request, url, storageOptions) {
       audio_sample_rate: readFormTextField(formData, 'audio_sample_rate'),
       scene_animation: readFormJsonField(formData, 'scene_animation', { required: true }),
       voiceover_mix: readFormJsonField(formData, 'voiceover_mix'),
+      background_music_id: readFormTextField(formData, 'background_music_id'),
+      background_music_mix: readFormJsonField(formData, 'background_music_mix'),
       image_binary: await readFormBinaryField(formData, 'image_binary', { required: true }),
     };
 
@@ -1601,6 +1624,8 @@ async function readJoinClipsMultipartBody(request, url, maxBodyBytes = DEFAULT_M
       video_codec: readFormTextField(formData, 'video_codec'),
       encode_preset: readFormTextField(formData, 'encode_preset'),
       crf: readFormTextField(formData, 'crf'),
+      background_music_id: readFormTextField(formData, 'background_music_id'),
+      background_music_mix: readFormJsonField(formData, 'background_music_mix'),
     }, formData.cleanup);
   } catch (error) {
     await formData.cleanup();
