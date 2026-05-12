@@ -1469,7 +1469,7 @@ async function readGenerateClipMultipartBody(request, url, storageOptions) {
     const subtitleHighlightWords = readFormTextField(formData, 'subtitle_highlight_words')
       ?? readFormTextField(formData, 'highlight_words');
     const payload = {
-      overlay_text: readFormTextField(formData, 'overlay_text', { required: true }),
+      overlay_text: readFormTextField(formData, 'overlay_text'),
       audio_text: readFormTextField(formData, 'audio_text'),
       audio_language: readFormTextField(formData, 'audio_language'),
       subtitle_theme: readFormTextField(formData, 'subtitle_theme'),
