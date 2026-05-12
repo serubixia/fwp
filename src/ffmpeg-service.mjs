@@ -76,6 +76,9 @@ const DEFAULT_SUBTITLE_DEVICE = 'cpu';
 const DEFAULT_SUBTITLE_THEME = 'default';
 const SUBTITLE_LAYOUT_BASE_WIDTH = 1920;
 const SUBTITLE_LAYOUT_BASE_HEIGHT = 1080;
+const LIBASS_DEFAULT_PLAYRES_X = 384;
+const LIBASS_DEFAULT_PLAYRES_Y = 288;
+const DEFAULT_SUBTITLE_OUTLINE = 2;
 const SUBTITLE_THEME_PROFILES = Object.freeze({
   default: Object.freeze({
     font_name: 'DejaVu Sans',
@@ -1428,6 +1431,31 @@ function buildSubtitleForceStyle(subtitleTheme, width = SUBTITLE_LAYOUT_BASE_WID
   ].join(',');
 }
 
+function buildAssSubtitleForceStyle(subtitleTheme, width = SUBTITLE_LAYOUT_BASE_WIDTH, height = SUBTITLE_LAYOUT_BASE_HEIGHT) {
+  const themeProfile = getScaledSubtitleThemeProfile(subtitleTheme, width, height);
+  const normalizedWidth = normalizePositiveInteger(width, SUBTITLE_LAYOUT_BASE_WIDTH, 'width');
+  const normalizedHeight = normalizePositiveInteger(height, SUBTITLE_LAYOUT_BASE_HEIGHT, 'height');
+  const horizontalScale = normalizedWidth / LIBASS_DEFAULT_PLAYRES_X;
+  const verticalScale = normalizedHeight / LIBASS_DEFAULT_PLAYRES_Y;
+
+  return [
+    `FontName=${themeProfile.font_name}`,
+    `Fontsize=${Math.max(Math.round(themeProfile.font_size * verticalScale), themeProfile.font_size)}`,
+    `PrimaryColour=${themeProfile.highlight_colour}`,
+    `SecondaryColour=${themeProfile.base_colour}`,
+    `OutlineColour=${themeProfile.outline_colour}`,
+    `BackColour=${themeProfile.back_colour}`,
+    `Bold=${themeProfile.bold}`,
+    `Alignment=${themeProfile.alignment}`,
+    `MarginL=${Math.max(Math.round(themeProfile.margin_l * horizontalScale), themeProfile.margin_l)}`,
+    `MarginR=${Math.max(Math.round(themeProfile.margin_r * horizontalScale), themeProfile.margin_r)}`,
+    `MarginV=${Math.max(Math.round(themeProfile.margin_v * verticalScale), themeProfile.margin_v)}`,
+    'BorderStyle=1',
+    `Outline=${Math.max(Math.round(DEFAULT_SUBTITLE_OUTLINE * verticalScale), DEFAULT_SUBTITLE_OUTLINE)}`,
+    'Shadow=0',
+  ].join(',');
+}
+
 function resolveWhisperxPythonBinary() {
   return normalizeOptionalString(
     process.env.WHISPERX_PYTHON
@@ -1548,7 +1576,9 @@ async function createAlignedSubtitleTrack({
     subtitle_language: audioLanguage,
     subtitle_theme: subtitleTheme,
     highlight_words: highlightWords,
-    force_style: highlightWords ? null : buildSubtitleForceStyle(subtitleTheme, width, height),
+    force_style: highlightWords
+      ? buildAssSubtitleForceStyle(subtitleTheme, width, height)
+      : buildSubtitleForceStyle(subtitleTheme, width, height),
   };
 }
 
