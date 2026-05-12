@@ -367,28 +367,12 @@ def build_ass_style_line(theme_profile) -> str:
     )
 
 
-def resolve_centered_alignment(alignment: int) -> int:
-    if alignment >= 7:
-        return 8
-    if alignment >= 4:
-        return 5
-    return 2
-
-
 def build_ass_position_override(theme_profile, play_res_x: int, play_res_y: int) -> str:
     normalized_play_res_x = max(int(play_res_x), 1)
     normalized_play_res_y = max(int(play_res_y), 1)
-    centered_alignment = resolve_centered_alignment(int(theme_profile['alignment']))
     x_position = normalized_play_res_x // 2
-
-    if centered_alignment >= 7:
-        y_position = theme_profile['margin_v']
-    elif centered_alignment >= 4:
-        y_position = normalized_play_res_y // 2
-    else:
-        y_position = normalized_play_res_y - theme_profile['margin_v']
-
-    return f'{{\\an{centered_alignment}\\pos({x_position},{y_position})}}'
+    y_position = normalized_play_res_y // 2
+    return f'{{\\an5\\pos({x_position},{y_position})}}'
 
 
 def build_ass_header(play_res_x: int, play_res_y: int) -> str:
