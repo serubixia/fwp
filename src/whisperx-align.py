@@ -367,14 +367,6 @@ def build_ass_style_line(theme_profile) -> str:
     )
 
 
-def build_ass_position_override(theme_profile, play_res_x: int, play_res_y: int) -> str:
-    normalized_play_res_x = max(int(play_res_x), 1)
-    normalized_play_res_y = max(int(play_res_y), 1)
-    x_position = normalized_play_res_x // 2
-    y_position = normalized_play_res_y // 2
-    return f'{{\\an5\\pos({x_position},{y_position})}}'
-
-
 def build_ass_header(play_res_x: int, play_res_y: int) -> str:
     normalized_play_res_x = max(int(play_res_x), 1)
     normalized_play_res_y = max(int(play_res_y), 1)
@@ -399,7 +391,6 @@ def write_ass(output_path: str, segments, max_line_width: int, max_line_count: i
     output.parent.mkdir(parents=True, exist_ok=True)
 
     header = build_ass_header(play_res_x, play_res_y)
-    position_override = build_ass_position_override(theme_profile, play_res_x, play_res_y)
 
     with output.open('w', encoding='utf-8') as handle:
         handle.write(header)
@@ -407,7 +398,7 @@ def write_ass(output_path: str, segments, max_line_width: int, max_line_count: i
         for segment in segments:
             dialogue_text = build_ass_dialogue_text(segment, max_line_width, max_line_count, highlight_words)
             handle.write(
-                f"Dialogue: 0,{format_ass_timestamp(segment['start'])},{format_ass_timestamp(segment['end'])},ViralCaption,,0,0,0,,{position_override}{dialogue_text}\n"
+                f"Dialogue: 0,{format_ass_timestamp(segment['start'])},{format_ass_timestamp(segment['end'])},ViralCaption,,0,0,0,,{dialogue_text}\n"
             )
 
 
