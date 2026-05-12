@@ -74,6 +74,8 @@ const DEFAULT_BORDER_COLOR = 'black@0.45';
 const DEFAULT_SUBTITLE_LANGUAGE = 'es';
 const DEFAULT_SUBTITLE_DEVICE = 'cpu';
 const DEFAULT_SUBTITLE_THEME = 'default';
+const SUBTITLE_LAYOUT_BASE_WIDTH = 1920;
+const SUBTITLE_LAYOUT_BASE_HEIGHT = 1080;
 const SUBTITLE_THEME_PROFILES = Object.freeze({
   default: Object.freeze({
     font_name: 'DejaVu Sans',
@@ -1368,8 +1370,46 @@ function getSubtitleThemeProfile(theme) {
   return SUBTITLE_THEME_PROFILES[normalizeSubtitleTheme(theme)];
 }
 
-function buildSubtitleForceStyle(subtitleTheme) {
+export function getScaledSubtitleThemeProfile(subtitleTheme, width = SUBTITLE_LAYOUT_BASE_WIDTH, height = SUBTITLE_LAYOUT_BASE_HEIGHT) {
   const themeProfile = getSubtitleThemeProfile(subtitleTheme);
+  const normalizedWidth = normalizePositiveInteger(width, SUBTITLE_LAYOUT_BASE_WIDTH, 'width');
+  const normalizedHeight = normalizePositiveInteger(height, SUBTITLE_LAYOUT_BASE_HEIGHT, 'height');
+  const layoutScale = Math.min(
+    normalizedWidth / SUBTITLE_LAYOUT_BASE_WIDTH,
+    normalizedHeight / SUBTITLE_LAYOUT_BASE_HEIGHT,
+    1,
+  );
+
+  return {
+    ...themeProfile,
+    font_size: Math.min(themeProfile.font_size, Math.max(Math.round(themeProfile.font_size * layoutScale), 12)),
+    margin_l: Math.min(themeProfile.margin_l, Math.max(Math.round(themeProfile.margin_l * layoutScale), 24)),
+    margin_r: Math.min(themeProfile.margin_r, Math.max(Math.round(themeProfile.margin_r * layoutScale), 24)),
+    margin_v: Math.min(themeProfile.margin_v, Math.max(Math.round(themeProfile.margin_v * layoutScale), 20)),
+  };
+}
+
+function resolveSubtitleTextLayout(scaledThemeProfile, width, height) {
+  const normalizedWidth = normalizePositiveInteger(width, SUBTITLE_LAYOUT_BASE_WIDTH, 'width');
+  const normalizedHeight = normalizePositiveInteger(height, SUBTITLE_LAYOUT_BASE_HEIGHT, 'height');
+  const isPortraitOrNarrow = normalizedHeight > normalizedWidth || normalizedWidth < 900;
+  const maxLineCount = isPortraitOrNarrow ? 3 : 2;
+  const availableWidth = Math.max(normalizedWidth - scaledThemeProfile.margin_l - scaledThemeProfile.margin_r, 120);
+  const averageCharacterWidth = Math.max(
+    scaledThemeProfile.font_size * (scaledThemeProfile.uppercase ? 0.78 : 0.68),
+    1,
+  );
+  const maxLineWidthCap = normalizedWidth <= 540 ? 18 : isPortraitOrNarrow ? 24 : 32;
+  const maxLineWidth = Math.max(12, Math.min(Math.floor(availableWidth / averageCharacterWidth), maxLineWidthCap));
+
+  return {
+    max_line_width: maxLineWidth,
+    max_line_count: maxLineCount,
+  };
+}
+
+function buildSubtitleForceStyle(subtitleTheme, width = SUBTITLE_LAYOUT_BASE_WIDTH, height = SUBTITLE_LAYOUT_BASE_HEIGHT) {
+  const themeProfile = getScaledSubtitleThemeProfile(subtitleTheme, width, height);
 
   return [
     `FontName=${themeProfile.font_name}`,
@@ -1449,6 +1489,8 @@ async function createAlignedSubtitleTrack({
   height,
   outputDir,
 }) {
+  const scaledThemeProfile = getScaledSubtitleThemeProfile(subtitleTheme, width, height);
+  const subtitleTextLayout = resolveSubtitleTextLayout(scaledThemeProfile, width, height);
   const transcriptPath = path.join(outputDir, 'voiceover-transcript.txt');
   const subtitlePath = path.join(outputDir, `voiceover-subtitles${highlightWords ? '.ass' : '.srt'}`);
   const whisperxArgs = [
@@ -1467,6 +1509,10 @@ async function createAlignedSubtitleTrack({
     String(normalizePositiveInteger(width, DEFAULT_WIDTH, 'width')),
     '--playres-y',
     String(normalizePositiveInteger(height, DEFAULT_HEIGHT, 'height')),
+    '--max-line-width',
+    String(subtitleTextLayout.max_line_width),
+    '--max-line-count',
+    String(subtitleTextLayout.max_line_count),
     '--theme',
     subtitleTheme,
   ];
@@ -1502,7 +1548,7 @@ async function createAlignedSubtitleTrack({
     subtitle_language: audioLanguage,
     subtitle_theme: subtitleTheme,
     highlight_words: highlightWords,
-    force_style: highlightWords ? null : buildSubtitleForceStyle(subtitleTheme),
+    force_style: highlightWords ? null : buildSubtitleForceStyle(subtitleTheme, width, height),
   };
 }
 
