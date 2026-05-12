@@ -44,8 +44,9 @@ const DEFAULT_SHUTDOWN_GRACE_MS = 10 * 1000;
 const DEFAULT_MULTIPART_STORAGE_SYNC_THRESHOLD_BYTES = 64 * 1024;
 const ASYNC_JOB_RESULT_DIR_PREFIX = 'ffmpeg-api-job-result-';
 const MULTIPART_UPLOAD_DIR_PREFIX = 'ffmpeg-api-upload-';
-const GENERATE_CLIP_JOB_PATH_PATTERN = /^\/v1\/render\/jobs\/([^/]+?)(?:\/(download))?$/;
-const JOIN_CLIPS_JOB_PATH_PATTERN = /^\/v1\/compose\/jobs\/([^/]+?)(?:\/(download))?$/;
+const GENERATE_CLIP_JOB_PATH_PATTERN = /^\/v1\/render\/jobs\/([^/]+?)(?:\/(?:(download)|artifacts\/([^/]+?)\/(download)))?$/;
+const JOIN_CLIPS_JOB_PATH_PATTERN = /^\/v1\/compose\/jobs\/([^/]+?)(?:\/(?:(download)|artifacts\/([^/]+?)\/(download)))?$/;
+const RESULT_ARTIFACT_ID_PATTERN = /^[A-Za-z0-9._-]+$/;
 const multipartPayloadCleanupHandlers = new WeakMap();
 
 function resolvePositiveIntegerOption(value, optionName, fallback) {
@@ -129,10 +130,25 @@ function summarizeBinaryField(upload) {
   };
 }
 
-function sanitizeResult(result) {
-  return result == null
+function sanitizeArtifact(artifact) {
+  return artifact == null
     ? null
-    : Object.fromEntries(Object.entries(result).filter(([key]) => !['buffer', 'file_path', 'temp_dir'].includes(key)));
+    : Object.fromEntries(Object.entries(artifact).filter(([key]) => key !== 'file_path'));
+}
+
+function sanitizeResult(result) {
+  if (result == null) {
+    return null;
+  }
+
+  const sanitizedEntries = Object.entries(result)
+    .filter(([key]) => !['buffer', 'file_path', 'temp_dir', 'artifacts'].includes(key));
+
+  if (Array.isArray(result.artifacts)) {
+    sanitizedEntries.push(['artifacts', result.artifacts.map((artifact) => sanitizeArtifact(artifact))]);
+  }
+
+  return Object.fromEntries(sanitizedEntries);
 }
 
 function resolveAsyncJobStorageRoot(value) {
@@ -157,66 +173,208 @@ function isPathInsideDirectory(targetPath, directoryPath) {
   return relativePath === '' || (!relativePath.startsWith('..') && !path.isAbsolute(relativePath));
 }
 
+function normalizeResultArtifactEntries(result) {
+  if (result?.artifacts == null) {
+    return [];
+  }
+
+  if (!Array.isArray(result.artifacts)) {
+    throw new Error('result.artifacts must be an array when present.');
+  }
+
+  const seenArtifactIds = new Set();
+
+  return result.artifacts.map((artifact, index) => {
+    if (!artifact || typeof artifact !== 'object') {
+      throw new Error(`result.artifacts[${index}] must be an object.`);
+    }
+
+    const artifactIdValue = artifact.artifact_id ?? artifact.id;
+    if (typeof artifactIdValue !== 'string' || artifactIdValue.trim().length === 0) {
+      throw new Error(`result.artifacts[${index}].artifact_id must be a non-empty string.`);
+    }
+
+    const artifactId = artifactIdValue.trim();
+    if (!RESULT_ARTIFACT_ID_PATTERN.test(artifactId)) {
+      throw new Error(`result.artifacts[${index}].artifact_id contains unsupported characters.`);
+    }
+
+    if (seenArtifactIds.has(artifactId)) {
+      throw new Error(`result.artifacts contains duplicate artifact_id values: ${artifactId}`);
+    }
+    seenArtifactIds.add(artifactId);
+
+    const artifactPath = resolveResultOwnedPath(artifact.file_path, `result.artifacts[${index}].file_path`);
+    if (artifactPath == null) {
+      throw new Error(`result.artifacts[${index}].file_path is required.`);
+    }
+
+    const filename = path.basename(String(artifact.filename || path.basename(artifactPath) || `${artifactId}.bin`));
+    const contentType = typeof artifact.content_type === 'string' && artifact.content_type.trim().length > 0
+      ? artifact.content_type.trim()
+      : 'application/octet-stream';
+
+    return {
+      ...artifact,
+      artifact_id: artifactId,
+      file_path: artifactPath,
+      filename,
+      content_type: contentType,
+    };
+  });
+}
+
+function buildUniqueResultFilename(preferredName, usedNames, fallbackName) {
+  const normalizedName = path.basename(String(preferredName || fallbackName));
+  if (!usedNames.has(normalizedName)) {
+    usedNames.add(normalizedName);
+    return normalizedName;
+  }
+
+  const parsedName = path.parse(normalizedName);
+  let counter = 1;
+
+  while (true) {
+    const candidateName = `${parsedName.name}-${counter}${parsedName.ext}`;
+    if (!usedNames.has(candidateName)) {
+      usedNames.add(candidateName);
+      return candidateName;
+    }
+
+    counter += 1;
+  }
+}
+
+function buildPersistedResultPayload(result, { filename, artifacts } = {}) {
+  const persistedResult = sanitizeResult(result);
+  if (persistedResult == null) {
+    return null;
+  }
+
+  if (filename != null) {
+    persistedResult.filename = filename;
+  }
+
+  if (artifacts != null) {
+    persistedResult.artifacts = artifacts.map((artifact) => sanitizeArtifact(artifact));
+  }
+
+  return persistedResult;
+}
+
 async function persistJobResult(result, { jobId, jobType, storageRoot, storageMaxBytes }) {
   if (result == null) {
     return {
       result: null,
       file_path: null,
       temp_dir: null,
+      artifacts: [],
     };
   }
 
   const stagedFilePath = resolveResultOwnedPath(result.file_path, 'result.file_path');
   const stagedTempDir = resolveResultOwnedPath(result.temp_dir, 'result.temp_dir');
+  const stagedArtifacts = normalizeResultArtifactEntries(result);
 
-  if (stagedFilePath != null) {
-    if (stagedTempDir != null && !isPathInsideDirectory(stagedFilePath, stagedTempDir)) {
+  if (stagedTempDir != null) {
+    if (stagedFilePath != null && !isPathInsideDirectory(stagedFilePath, stagedTempDir)) {
       throw new Error('result.file_path must stay inside result.temp_dir.');
     }
 
+    for (const artifact of stagedArtifacts) {
+      if (!isPathInsideDirectory(artifact.file_path, stagedTempDir)) {
+        throw new Error(`result.artifacts.${artifact.artifact_id}.file_path must stay inside result.temp_dir.`);
+      }
+    }
+  }
+
+  const artifactSourceEntries = await Promise.all(stagedArtifacts.map(async (artifact) => {
+    const sourceStats = await stat(artifact.file_path);
+    if (!sourceStats.isFile()) {
+      throw new Error(`result.artifacts.${artifact.artifact_id}.file_path must point to a file.`);
+    }
+
+    return {
+      ...artifact,
+      size_bytes: sourceStats.size,
+    };
+  }));
+
+  const totalArtifactBytes = artifactSourceEntries.reduce((sum, artifact) => sum + artifact.size_bytes, 0);
+
+  if (stagedFilePath != null) {
     const sourceStats = await stat(stagedFilePath);
     if (!sourceStats.isFile()) {
       throw new Error('result.file_path must point to a file.');
     }
 
-    if (stagedTempDir != null && isPathInsideDirectory(stagedTempDir, storageRoot)) {
+    const persistedFilename = path.basename(String(result.filename || path.basename(stagedFilePath) || `${jobType}-${jobId}.bin`));
+    const totalSizeBytes = sourceStats.size + totalArtifactBytes;
+
+    if (
+      stagedTempDir != null
+      && isPathInsideDirectory(stagedTempDir, storageRoot)
+      && artifactSourceEntries.every((artifact) => isPathInsideDirectory(artifact.file_path, stagedTempDir))
+    ) {
       await adjustManagedStorageUsageBytes({
         storageRoot,
-        deltaBytes: sourceStats.size,
+        deltaBytes: totalSizeBytes,
       });
 
       return {
-        result: sanitizeResult(result),
+        result: buildPersistedResultPayload(result, {
+          filename: persistedFilename,
+          artifacts: artifactSourceEntries,
+        }),
         file_path: stagedFilePath,
         temp_dir: stagedTempDir,
-        size_bytes: sourceStats.size,
+        size_bytes: totalSizeBytes,
+        artifacts: artifactSourceEntries,
       };
     }
 
     const storageReservation = await reserveManagedStorageBytes({
       storageRoot,
       maxBytes: storageMaxBytes,
-      bytes: sourceStats.size,
+      bytes: totalSizeBytes,
     });
     const tempDir = await mkdtemp(path.join(storageRoot, ASYNC_JOB_RESULT_DIR_PREFIX));
-    const filename = path.basename(String(result.filename || path.basename(stagedFilePath) || `${jobType}-${jobId}.bin`));
+    const usedNames = new Set();
+    const filename = buildUniqueResultFilename(persistedFilename, usedNames, `${jobType}-${jobId}.bin`);
     const filePath = path.join(tempDir, filename);
 
     try {
       await pipeline(createReadStream(stagedFilePath), createWriteStream(filePath));
+      const persistedArtifacts = [];
+
+      for (const artifact of artifactSourceEntries) {
+        const artifactFilename = buildUniqueResultFilename(artifact.filename, usedNames, `${artifact.artifact_id}.bin`);
+        const artifactPath = path.join(tempDir, artifactFilename);
+        await pipeline(createReadStream(artifact.file_path), createWriteStream(artifactPath));
+        persistedArtifacts.push({
+          ...artifact,
+          file_path: artifactPath,
+          filename: artifactFilename,
+        });
+      }
+
       await adjustManagedStorageUsageBytes({
         storageRoot,
-        deltaBytes: sourceStats.size,
+        deltaBytes: totalSizeBytes,
       });
       if (stagedTempDir != null) {
         await rm(stagedTempDir, { recursive: true, force: true });
       }
 
       return {
-        result: sanitizeResult(result),
+        result: buildPersistedResultPayload(result, {
+          filename,
+          artifacts: persistedArtifacts,
+        }),
         file_path: filePath,
         temp_dir: tempDir,
-        size_bytes: sourceStats.size,
+        size_bytes: totalSizeBytes,
+        artifacts: persistedArtifacts,
       };
     } catch (error) {
       await rm(tempDir, { recursive: true, force: true });
@@ -228,34 +386,60 @@ async function persistJobResult(result, { jobId, jobType, storageRoot, storageMa
 
   if (result.buffer == null) {
     return {
-      result: sanitizeResult(result),
+      result: buildPersistedResultPayload(result, {
+        artifacts: artifactSourceEntries,
+      }),
       file_path: null,
       temp_dir: null,
+      artifacts: artifactSourceEntries,
     };
   }
 
   const outputBuffer = Buffer.isBuffer(result.buffer) ? result.buffer : Buffer.from(result.buffer);
+  const totalSizeBytes = outputBuffer.length + totalArtifactBytes;
   const storageReservation = await reserveManagedStorageBytes({
     storageRoot,
     maxBytes: storageMaxBytes,
-    bytes: outputBuffer.length,
+    bytes: totalSizeBytes,
   });
   const tempDir = await mkdtemp(path.join(storageRoot, ASYNC_JOB_RESULT_DIR_PREFIX));
-  const filename = path.basename(String(result.filename || `${jobType}-${jobId}.bin`));
+  const usedNames = new Set();
+  const filename = buildUniqueResultFilename(result.filename, usedNames, `${jobType}-${jobId}.bin`);
   const filePath = path.join(tempDir, filename);
 
   try {
     await writeFile(filePath, outputBuffer);
+    const persistedArtifacts = [];
+
+    for (const artifact of artifactSourceEntries) {
+      const artifactFilename = buildUniqueResultFilename(artifact.filename, usedNames, `${artifact.artifact_id}.bin`);
+      const artifactPath = path.join(tempDir, artifactFilename);
+      await pipeline(createReadStream(artifact.file_path), createWriteStream(artifactPath));
+      persistedArtifacts.push({
+        ...artifact,
+        file_path: artifactPath,
+        filename: artifactFilename,
+      });
+    }
+
     await adjustManagedStorageUsageBytes({
       storageRoot,
-      deltaBytes: outputBuffer.length,
+      deltaBytes: totalSizeBytes,
     });
 
+    if (stagedTempDir != null) {
+      await rm(stagedTempDir, { recursive: true, force: true });
+    }
+
     return {
-      result: sanitizeResult(result),
+      result: buildPersistedResultPayload(result, {
+        filename,
+        artifacts: persistedArtifacts,
+      }),
       file_path: filePath,
       temp_dir: tempDir,
-      size_bytes: outputBuffer.length,
+      size_bytes: totalSizeBytes,
+      artifacts: persistedArtifacts,
     };
   } catch (error) {
     await rm(tempDir, { recursive: true, force: true });
@@ -472,6 +656,10 @@ function buildGenerateClipJobPaths(jobId) {
   };
 }
 
+function buildGenerateClipArtifactDownloadPath(jobId, artifactId) {
+  return `/v1/render/jobs/${encodeURIComponent(jobId)}/artifacts/${encodeURIComponent(artifactId)}/download`;
+}
+
 function buildJoinClipsJobPaths(jobId) {
   const encodedJobId = encodeURIComponent(jobId);
   const statusPath = `/v1/compose/jobs/${encodedJobId}`;
@@ -482,12 +670,35 @@ function buildJoinClipsJobPaths(jobId) {
   };
 }
 
+function buildJoinClipsArtifactDownloadPath(jobId, artifactId) {
+  return `/v1/compose/jobs/${encodeURIComponent(jobId)}/artifacts/${encodeURIComponent(artifactId)}/download`;
+}
+
 function isJobFailureStatus(status) {
   return status === 'failed' || status === 'cancelled' || status === 'failed_shutdown';
 }
 
 function isJobTerminalStatus(status) {
   return status === 'completed' || isJobFailureStatus(status);
+}
+
+function buildJobResultPayload(result, artifacts, buildArtifactDownloadPath) {
+  const sanitizedResult = sanitizeResult(result);
+  if (sanitizedResult == null) {
+    return null;
+  }
+
+  if (!Array.isArray(artifacts) || artifacts.length === 0) {
+    return sanitizedResult;
+  }
+
+  return {
+    ...sanitizedResult,
+    artifacts: artifacts.map((artifact) => ({
+      ...sanitizeArtifact(artifact),
+      download_path: buildArtifactDownloadPath(artifact.artifact_id),
+    })),
+  };
 }
 
 function buildGenerateClipJobPayload(job) {
@@ -497,6 +708,7 @@ function buildGenerateClipJobPayload(job) {
     result_file_path,
     result_temp_dir,
     result_size_bytes,
+    result_artifacts,
     payload_cleanup,
     execution_promise,
     cancellation_status,
@@ -504,9 +716,11 @@ function buildGenerateClipJobPayload(job) {
     cancelled_process_count,
     ...jobWithoutResult
   } = job;
-  const sanitizedResult = result == null
-    ? null
-    : sanitizeResult(result);
+  const sanitizedResult = buildJobResultPayload(
+    result,
+    result_artifacts,
+    (artifactId) => buildGenerateClipArtifactDownloadPath(job.job_id, artifactId)
+  );
 
   return {
     ...jobWithoutResult,
@@ -522,6 +736,7 @@ function buildJoinClipsJobPayload(job) {
     result_file_path,
     result_temp_dir,
     result_size_bytes,
+    result_artifacts,
     payload_cleanup,
     execution_promise,
     cancellation_status,
@@ -529,9 +744,11 @@ function buildJoinClipsJobPayload(job) {
     cancelled_process_count,
     ...jobWithoutResult
   } = job;
-  const sanitizedResult = result == null
-    ? null
-    : sanitizeResult(result);
+  const sanitizedResult = buildJobResultPayload(
+    result,
+    result_artifacts,
+    (artifactId) => buildJoinClipsArtifactDownloadPath(job.job_id, artifactId)
+  );
 
   return {
     ...jobWithoutResult,
@@ -548,7 +765,10 @@ function matchGenerateClipJobPath(pathname) {
 
   return {
     jobId: decodeURIComponent(match[1]),
-    action: match[2] === 'download' ? 'download' : 'status',
+    action: match[2] === 'download'
+      ? 'download'
+      : (match[4] === 'download' ? 'artifact_download' : 'status'),
+    artifactId: match[3] == null ? null : decodeURIComponent(match[3]),
   };
 }
 
@@ -560,8 +780,19 @@ function matchJoinClipsJobPath(pathname) {
 
   return {
     jobId: decodeURIComponent(match[1]),
-    action: match[2] === 'download' ? 'download' : 'status',
+    action: match[2] === 'download'
+      ? 'download'
+      : (match[4] === 'download' ? 'artifact_download' : 'status'),
+    artifactId: match[3] == null ? null : decodeURIComponent(match[3]),
   };
+}
+
+function findPersistedJobArtifact(job, artifactId) {
+  if (!Array.isArray(job?.result_artifacts)) {
+    return null;
+  }
+
+  return job.result_artifacts.find((artifact) => artifact.artifact_id === artifactId) ?? null;
 }
 
 function createAsyncJobQueueFullError(schedulerState) {
@@ -739,6 +970,7 @@ function createAsyncBinaryJobStore({
       job.result_temp_dir = null;
       job.result_file_path = null;
       job.result_size_bytes = null;
+      job.result_artifacts = [];
     }
   }
 
@@ -858,6 +1090,7 @@ function createAsyncBinaryJobStore({
         job.result_file_path = persistedResult.file_path;
         job.result_temp_dir = persistedResult.temp_dir;
         job.result_size_bytes = persistedResult.size_bytes ?? null;
+        job.result_artifacts = persistedResult.artifacts ?? [];
         if (job.cancellation_status != null) {
           throw new Error(job.cancellation_reason ?? 'Job cancelled.');
         }
@@ -920,6 +1153,7 @@ function createAsyncBinaryJobStore({
         result_file_path: null,
         result_temp_dir: null,
         result_size_bytes: null,
+        result_artifacts: [],
         payload_cleanup: payloadCleanup,
         execution_promise: null,
         cancellation_status: null,
@@ -1494,6 +1728,7 @@ async function readGenerateClipMultipartBody(request, url, storageOptions) {
       audio_text: readFormTextField(formData, 'audio_text'),
       audio_language: readFormTextField(formData, 'audio_language'),
       subtitle_theme: readFormTextField(formData, 'subtitle_theme'),
+      subtitle_delivery: readFormTextField(formData, 'subtitle_delivery'),
       subtitle_highlight_words: subtitleHighlightWords,
       duration_seconds: readFormTextField(formData, 'duration_seconds', { required: true }),
       width: readFormTextField(formData, 'width'),
@@ -1586,6 +1821,8 @@ async function readJoinClipsMultipartBody(request, url, maxBodyBytes = DEFAULT_M
 
       const clipPath = clip.clip_path ?? clip.path;
       const clipBinaryField = clip.clip_binary_field ?? clip.clipBinaryField;
+      const subtitlePath = clip.subtitle_path ?? clip.subtitlePath;
+      const subtitleBinaryField = clip.subtitle_binary_field ?? clip.subtitleBinaryField;
 
       if (clipPath == null && clipBinaryField == null) {
         throw new Error(`clips[${index}] must include clip_path or clip_binary_field.`);
@@ -1595,9 +1832,27 @@ async function readJoinClipsMultipartBody(request, url, maxBodyBytes = DEFAULT_M
         throw new Error(`clips[${index}] must not include both clip_path and clip_binary_field.`);
       }
 
+      if (subtitlePath != null && subtitleBinaryField != null) {
+        throw new Error(`clips[${index}] must not include both subtitle_path and subtitle_binary_field.`);
+      }
+
       const normalizedClip = {
         transition_to_next: clip.transition_to_next,
       };
+
+      if (subtitlePath != null) {
+        if (typeof subtitlePath !== 'string' || subtitlePath.trim().length === 0) {
+          throw new Error(`clips[${index}].subtitle_path must be a non-empty string.`);
+        }
+
+        normalizedClip.subtitle_path = subtitlePath.trim();
+      } else if (subtitleBinaryField != null) {
+        normalizedClip.subtitle_binary = await readFormBinaryField(
+          formData,
+          normalizeJoinClipBinaryFieldName(subtitleBinaryField, index),
+          { required: true }
+        );
+      }
 
       if (clipPath != null) {
         if (typeof clipPath !== 'string' || clipPath.trim().length === 0) {
@@ -1799,7 +2054,7 @@ export function createServer({
             return;
           }
 
-          if (jobMatch.action === 'download') {
+            if (jobMatch.action === 'download' || jobMatch.action === 'artifact_download') {
             if (job.status !== 'completed' || job.result == null) {
               sendJson(response, 409, {
                 ok: false,
@@ -1808,6 +2063,29 @@ export function createServer({
                   : 'Render job is not completed yet.',
                 ...buildGenerateClipJobPayload(job),
               });
+              return;
+            }
+
+            if (jobMatch.action === 'artifact_download') {
+              const artifact = findPersistedJobArtifact(job, jobMatch.artifactId);
+              if (artifact == null) {
+                sendJson(response, 404, {
+                  ok: false,
+                  error: `Render job artifact ${jobMatch.artifactId} was not found.`,
+                  ...buildGenerateClipJobPayload(job),
+                });
+                return;
+              }
+
+              await sendBinaryFile(
+                response,
+                200,
+                artifact.file_path,
+                artifact.content_type,
+                {
+                  'content-disposition': `inline; filename="${artifact.filename}"`,
+                }
+              );
               return;
             }
 
@@ -1883,7 +2161,7 @@ export function createServer({
             return;
           }
 
-          if (joinClipsJobMatch.action === 'download') {
+          if (joinClipsJobMatch.action === 'download' || joinClipsJobMatch.action === 'artifact_download') {
             if (job.status !== 'completed' || job.result == null) {
               sendJson(response, 409, {
                 ok: false,
@@ -1892,6 +2170,29 @@ export function createServer({
                   : 'Compose job is not completed yet.',
                 ...buildJoinClipsJobPayload(job),
               });
+              return;
+            }
+
+            if (joinClipsJobMatch.action === 'artifact_download') {
+              const artifact = findPersistedJobArtifact(job, joinClipsJobMatch.artifactId);
+              if (artifact == null) {
+                sendJson(response, 404, {
+                  ok: false,
+                  error: `Compose job artifact ${joinClipsJobMatch.artifactId} was not found.`,
+                  ...buildJoinClipsJobPayload(job),
+                });
+                return;
+              }
+
+              await sendBinaryFile(
+                response,
+                200,
+                artifact.file_path,
+                artifact.content_type,
+                {
+                  'content-disposition': `inline; filename="${artifact.filename}"`,
+                }
+              );
               return;
             }
 
