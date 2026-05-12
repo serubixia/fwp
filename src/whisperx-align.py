@@ -62,6 +62,9 @@ SUBTITLE_THEME_PROFILES = {
     },
 }
 
+SUBTITLE_LAYOUT_BASE_WIDTH = 1920
+SUBTITLE_LAYOUT_BASE_HEIGHT = 1080
+
 
 def parse_args():
     parser = argparse.ArgumentParser(
@@ -87,6 +90,43 @@ def resolve_subtitle_theme_profile(theme: str):
         return SUBTITLE_THEME_PROFILES[theme]
     except KeyError as error:
         raise ValueError(f'Unsupported subtitle theme: {theme}') from error
+
+
+def get_scaled_theme_profile(theme_profile, play_res_x: int, play_res_y: int):
+    normalized_play_res_x = max(int(play_res_x), 1)
+    normalized_play_res_y = max(int(play_res_y), 1)
+    layout_scale = min(
+        normalized_play_res_x / SUBTITLE_LAYOUT_BASE_WIDTH,
+        normalized_play_res_y / SUBTITLE_LAYOUT_BASE_HEIGHT,
+        1.0,
+    )
+
+    return {
+        **theme_profile,
+        'font_size': min(theme_profile['font_size'], max(int(round(theme_profile['font_size'] * layout_scale)), 12)),
+        'margin_l': min(theme_profile['margin_l'], max(int(round(theme_profile['margin_l'] * layout_scale)), 24)),
+        'margin_r': min(theme_profile['margin_r'], max(int(round(theme_profile['margin_r'] * layout_scale)), 24)),
+        'margin_v': min(theme_profile['margin_v'], max(int(round(theme_profile['margin_v'] * layout_scale)), 20)),
+    }
+
+
+def resolve_subtitle_text_layout(theme_profile, play_res_x: int, play_res_y: int):
+    normalized_play_res_x = max(int(play_res_x), 1)
+    normalized_play_res_y = max(int(play_res_y), 1)
+    is_portrait_or_narrow = normalized_play_res_y > normalized_play_res_x or normalized_play_res_x < 900
+    max_line_count = 3 if is_portrait_or_narrow else 2
+    available_width = max(normalized_play_res_x - theme_profile['margin_l'] - theme_profile['margin_r'], 120)
+    average_character_width = max(
+        theme_profile['font_size'] * (0.78 if theme_profile['uppercase'] else 0.68),
+        1,
+    )
+    max_line_width_cap = 18 if normalized_play_res_x <= 540 else 24 if is_portrait_or_narrow else 32
+    max_line_width = max(12, min(int(available_width / average_character_width), max_line_width_cap))
+
+    return {
+        'max_line_width': max_line_width,
+        'max_line_count': max_line_count,
+    }
 
 
 def transform_subtitle_text(text: str, theme_profile) -> str:
@@ -400,7 +440,12 @@ def align_transcript(audio_path: str, transcript: str, language: str, device: st
 def main():
     args = parse_args()
     transcript = read_transcript(args.transcript_path)
-    theme_profile = resolve_subtitle_theme_profile(args.theme)
+    theme_profile = get_scaled_theme_profile(
+        resolve_subtitle_theme_profile(args.theme),
+        args.playres_x,
+        args.playres_y,
+    )
+    subtitle_text_layout = resolve_subtitle_text_layout(theme_profile, args.playres_x, args.playres_y)
     aligned_result, audio_duration_seconds = align_transcript(
         args.audio_path,
         transcript,
@@ -412,8 +457,8 @@ def main():
         aligned_result,
         transform_subtitle_text(transcript, theme_profile),
         audio_duration_seconds,
-        args.max_line_width,
-        args.max_line_count,
+        args.max_line_width if args.max_line_width > 0 else subtitle_text_layout['max_line_width'],
+        args.max_line_count if args.max_line_count > 0 else subtitle_text_layout['max_line_count'],
     )
 
     for segment in normalized_segments:
@@ -429,8 +474,8 @@ def main():
     output_format = write_output(
         args.output_path,
         normalized_segments,
-        args.max_line_width,
-        args.max_line_count,
+        args.max_line_width if args.max_line_width > 0 else subtitle_text_layout['max_line_width'],
+        args.max_line_count if args.max_line_count > 0 else subtitle_text_layout['max_line_count'],
         args.highlight_words,
         theme_profile,
         args.playres_x,
