@@ -1434,6 +1434,10 @@ function buildSubtitleLayoutForceStyle(subtitleTheme, width = SUBTITLE_LAYOUT_BA
   return [
     `FontName=${themeProfile.font_name}`,
     `Fontsize=${themeProfile.font_size}`,
+    `PrimaryColour=${themeProfile.highlight_colour}`,
+    `SecondaryColour=${themeProfile.base_colour}`,
+    `OutlineColour=${themeProfile.outline_colour}`,
+    `BackColour=${themeProfile.back_colour}`,
     `Bold=${themeProfile.bold}`,
     `Alignment=${themeProfile.alignment}`,
     `MarginL=${themeProfile.margin_l}`,
