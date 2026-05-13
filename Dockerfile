@@ -58,12 +58,9 @@ COPY --from=whisperx-builder /opt/whisperx /opt/whisperx
 COPY --from=whisperx-builder /opt/nltk_data /opt/nltk_data
 
 RUN mkdir -p /app/channels/economia/audio/long-form /app/channels/economia/audio/shorts \
-  && cp /app/audio/denis-pavlov-music-podcast-smooth-jazz-instrumental-music-225674.mp3 /app/channels/economia/audio/long-form/denis-pavlov-music-podcast-smooth-jazz-instrumental-music-225674.mp3 \
-  && cp /app/audio/alex_kizenkov-stomps-and-claps-percussion-and-rhythm-141190.mp3 /app/channels/economia/audio/shorts/alex_kizenkov-stomps-and-claps-percussion-and-rhythm-141190.mp3 \
-  && cp /app/audio/litesaturation-groovy-rock-short-110355.mp3 /app/channels/economia/audio/shorts/litesaturation-groovy-rock-short-110355.mp3 \
-  && cp /app/audio/loksii-funk-funk-intro-295005.mp3 /app/channels/economia/audio/shorts/loksii-funk-funk-intro-295005.mp3 \
-  && cp /app/audio/prettyjohn1-rock-496340.mp3 /app/channels/economia/audio/shorts/prettyjohn1-rock-496340.mp3 \
-  && cp /app/audio/watermello-funky-funk-short_30s-493208.mp3 /app/channels/economia/audio/shorts/watermello-funky-funk-short_30s-493208.mp3
+  && long_form_track='denis-pavlov-music-podcast-smooth-jazz-instrumental-music-225674.mp3' \
+  && cp "/app/audio/${long_form_track}" "/app/channels/economia/audio/long-form/${long_form_track}" \
+  && find /app/audio -maxdepth 1 -type f ! -name "${long_form_track}" -exec cp '{}' /app/channels/economia/audio/shorts/ ';'
 
 RUN rm -rf /app/audio
 
