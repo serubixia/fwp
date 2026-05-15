@@ -57,16 +57,9 @@ COPY audio ./audio
 COPY --from=whisperx-builder /opt/whisperx /opt/whisperx
 COPY --from=whisperx-builder /opt/nltk_data /opt/nltk_data
 
-RUN mkdir -p /app/channels/economia/audio/long-form /app/channels/economia/audio/shorts \
-  && long_form_track='denis-pavlov-music-podcast-smooth-jazz-instrumental-music-225674.mp3' \
-  && cp "/app/audio/${long_form_track}" "/app/channels/economia/audio/long-form/${long_form_track}" \
-  && find /app/audio -maxdepth 1 -type f ! -name "${long_form_track}" -exec cp '{}' /app/channels/economia/audio/shorts/ ';'
-
-RUN rm -rf /app/audio
-
 ENV PORT=3000
 ENV WORKSPACE_ROOT=/workspace
-ENV CHANNEL_AUDIO_ROOT=/app/channels
+ENV BACKGROUND_MUSIC_ROOT=/app/audio
 ENV FONT_FILE=/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf
 ENV NLTK_DATA=/opt/nltk_data
 ENV WHISPERX_PYTHON=/opt/whisperx/bin/python
