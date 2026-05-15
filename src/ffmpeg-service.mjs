@@ -79,7 +79,8 @@ const DEFAULT_BACKGROUND_MUSIC_DUCKING_ATTACK_MS = 20;
 const DEFAULT_BACKGROUND_MUSIC_DUCKING_RELEASE_MS = 250;
 const BACKGROUND_MUSIC_COLLECTIONS = Object.freeze(['long-form', 'shorts']);
 const BACKGROUND_MUSIC_EXTENSIONS = Object.freeze(['.mp3', '.wav', '.m4a', '.aac', '.ogg', '.flac']);
-const DEFAULT_CHANNEL_AUDIO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..', 'channels');
+const DEFAULT_BACKGROUND_MUSIC_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', 'audio');
+const LEGACY_BACKGROUND_MUSIC_ID_FORMAT = '<channel_slug>/<long-form|shorts>/<filename>';
 const DEFAULT_FONT_SIZE = 72;
 const DEFAULT_FONT_COLOR = 'white';
 const DEFAULT_BORDER_COLOR = 'black@0.45';
@@ -687,12 +688,12 @@ function resolveWorkspacePath(inputPath, label) {
   return resolvedPath;
 }
 
-function resolveChannelAudioRoot(value = process.env.CHANNEL_AUDIO_ROOT) {
+function resolveBackgroundMusicRoot(value = process.env.BACKGROUND_MUSIC_ROOT ?? process.env.CHANNEL_AUDIO_ROOT) {
   if (typeof value === 'string' && value.trim().length > 0) {
     return path.resolve(value.trim());
   }
 
-  return DEFAULT_CHANNEL_AUDIO_ROOT;
+  return DEFAULT_BACKGROUND_MUSIC_ROOT;
 }
 
 function isSupportedBackgroundMusicFilename(filename) {
@@ -701,17 +702,10 @@ function isSupportedBackgroundMusicFilename(filename) {
 
 function parseBackgroundMusicId(value, label = 'background_music_id') {
   const normalizedValue = ensureNonEmptyString(value, label);
-  const [channelSlug, collection, filename, ...extraParts] = normalizedValue.split('/');
-
-  if (extraParts.length > 0 || !channelSlug || !collection || !filename) {
-    throw new Error(`${label} must use the format <channel_slug>/<long-form|shorts>/<filename>.`);
-  }
-
-  if (!/^[a-z0-9-]+$/.test(channelSlug)) {
-    throw new Error(`${label}.channel must contain only lowercase letters, digits and hyphens.`);
-  }
-
-  ensureEnum(collection, BACKGROUND_MUSIC_COLLECTIONS, `${label}.collection`);
+  const legacyMatch = normalizedValue.match(/^([a-z0-9-]+)\/(long-form|shorts)\/([A-Za-z0-9][A-Za-z0-9._-]*)$/);
+  const filename = legacyMatch == null
+    ? normalizedValue
+    : legacyMatch[3];
 
   if (
     filename.startsWith('.')
@@ -719,37 +713,36 @@ function parseBackgroundMusicId(value, label = 'background_music_id') {
     || filename.includes('\\')
     || !/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(filename)
   ) {
-    throw new Error(`${label}.filename must be a safe file name.`);
+    throw new Error(`${label} must be a safe file name. Legacy ${LEGACY_BACKGROUND_MUSIC_ID_FORMAT} is still accepted.`);
   }
 
   if (!isSupportedBackgroundMusicFilename(filename)) {
-    throw new Error(`${label}.filename must use one of: ${BACKGROUND_MUSIC_EXTENSIONS.join(', ')}.`);
+    throw new Error(`${label} must use one of: ${BACKGROUND_MUSIC_EXTENSIONS.join(', ')}.`);
+  }
+
+  if (legacyMatch != null) {
+    ensureEnum(legacyMatch[2], BACKGROUND_MUSIC_COLLECTIONS, `${label}.collection`);
   }
 
   return {
-    id: `${channelSlug}/${collection}/${filename}`,
-    channel_slug: channelSlug,
-    collection,
+    id: filename,
     filename,
+    legacy_id: legacyMatch == null ? null : normalizedValue,
   };
-}
-
-function resolveBackgroundMusicCollectionRoot(channelSlug, collection) {
-  return path.join(resolveChannelAudioRoot(), channelSlug, 'audio', collection);
 }
 
 function resolveBundledBackgroundMusicPath(value, label = 'background_music_id') {
   const parsedId = parseBackgroundMusicId(value, label);
-  const collectionRoot = resolveBackgroundMusicCollectionRoot(parsedId.channel_slug, parsedId.collection);
-  const resolvedPath = path.resolve(collectionRoot, parsedId.filename);
-  const relativePath = path.relative(collectionRoot, resolvedPath);
+  const libraryRoot = resolveBackgroundMusicRoot();
+  const resolvedPath = path.resolve(libraryRoot, parsedId.filename);
+  const relativePath = path.relative(libraryRoot, resolvedPath);
 
   if (relativePath.startsWith('..') || path.isAbsolute(relativePath)) {
-    throw new Error(`${label} must stay inside the bundled channel audio library.`);
+    throw new Error(`${label} must stay inside the bundled background music library.`);
   }
 
   try {
-    const trackEntry = readdirSync(collectionRoot, { withFileTypes: true })
+    const trackEntry = readdirSync(libraryRoot, { withFileTypes: true })
       .find((entry) => entry.isFile() && entry.name === parsedId.filename);
 
     if (trackEntry == null) {
@@ -769,14 +762,14 @@ function resolveBundledBackgroundMusicPath(value, label = 'background_music_id')
   };
 }
 
-function listBundledBackgroundMusicEntries(channelSlug, collection) {
-  const collectionRoot = resolveBackgroundMusicCollectionRoot(channelSlug, collection);
+function listBundledBackgroundMusicEntries() {
+  const libraryRoot = resolveBackgroundMusicRoot();
 
   try {
-    return readdirSync(collectionRoot, { withFileTypes: true })
+    return readdirSync(libraryRoot, { withFileTypes: true })
       .filter((entry) => entry.isFile() && isSupportedBackgroundMusicFilename(entry.name))
       .map((entry) => ({
-        id: `${channelSlug}/${collection}/${entry.name}`,
+        id: entry.name,
         filename: entry.name,
       }))
       .sort((leftEntry, rightEntry) => leftEntry.id.localeCompare(rightEntry.id));
@@ -786,25 +779,7 @@ function listBundledBackgroundMusicEntries(channelSlug, collection) {
 }
 
 function buildBundledBackgroundMusicCatalog() {
-  const channelAudioRoot = resolveChannelAudioRoot();
-
-  try {
-    return Object.fromEntries(
-      readdirSync(channelAudioRoot, { withFileTypes: true })
-        .filter((entry) => entry.isDirectory())
-        .map((entry) => [
-          entry.name,
-          Object.fromEntries(
-            BACKGROUND_MUSIC_COLLECTIONS.map((collection) => [
-              collection,
-              listBundledBackgroundMusicEntries(entry.name, collection),
-            ])
-          ),
-        ])
-    );
-  } catch {
-    return {};
-  }
+  return listBundledBackgroundMusicEntries();
 }
 
 export function validateSceneAnimation(sceneAnimation, label = 'scene_animation') {
@@ -3133,8 +3108,9 @@ export function getPresetCatalog() {
       max_duration_seconds: 1.2,
     },
     background_music: {
-      id_format: '<channel_slug>/<long-form|shorts>/<filename>',
-      channels: buildBundledBackgroundMusicCatalog(),
+      id_format: '<filename>',
+      legacy_id_format_accepted: LEGACY_BACKGROUND_MUSIC_ID_FORMAT,
+      tracks: buildBundledBackgroundMusicCatalog(),
     },
   };
 }
